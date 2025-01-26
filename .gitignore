@@ -1,0 +1,9 @@
+.venv
+.cache
+transcripts
+tmp
+inputs
+mlx_models
+__pycache__
+*.pyc
+.DS_Store
