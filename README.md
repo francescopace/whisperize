@@ -1,6 +1,6 @@
 # Whisperize
 
-A Python application for real-time audio transcription and speaker diarization using Whisper and PyAnnote.
+A Python application for real-time audio transcription and speaker diarization using Faster-Whisper and PyAnnote.
 
 ## Features
 - Real-time audio transcription optimized for Apple Silicon using MLX

@@ -4,5 +4,6 @@
     "output_format": "text",
     "model": "turbo",
     "whisper_force_cpu": true,
-    "language": "it"
+    "language": "it",
+    "buffer_duration": 4
 }
