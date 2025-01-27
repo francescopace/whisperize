@@ -224,7 +224,8 @@ class Whisperize:
             condition_on_previous_text=True,
             initial_prompt=self.last_prompt,
             word_timestamps=True,
-            fp16=self.whisper.device.type != "cpu"
+            fp16=self.whisper.device.type != "cpu",
+            language=self.config.get('language', None)
         )
         
         text = result["text"].strip()

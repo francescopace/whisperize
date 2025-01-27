@@ -57,11 +57,17 @@ The application uses a `config.json` file for configuration. You can specify var
    {
        "huggingface_token": "your_token_here",
        "output_folder": "transcripts/",
-       "output_format": "text",
+       "output_format": "text", //or json
        "model": "base",
-       "whisper_force_cpu": false
-   }
+       "whisper_force_cpu": false,
+       "language": "it" //optional
+    }
    ```
+## Tuning Parameters (TODO)
+
+English (default): onset/offset = 0.5, min_duration = 0.2
+Italian: onset/offset = 0.7, min_duration = 0.3
+
 ### Models
 
 Transcribe with the following models: [https://github.com/openai/whisper?tab=readme-ov-file#available-models-and-languages](https://github.com/openai/whisper?tab=readme-ov-file#available-models-and-languages)

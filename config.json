@@ -3,5 +3,6 @@
     "output_folder": "transcripts/",
     "output_format": "text",
     "model": "tiny",
-    "whisper_force_cpu": true
+    "whisper_force_cpu": true,
+    "language": "it"
 }
