@@ -2,7 +2,6 @@
     "huggingface_token": "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",
     "output_folder": "transcripts/",
     "output_format": "text",
-    "temp_folder": "tmp/",
-    "model": "turbo",
+    "model": "tiny.en",
     "whisper_force_cpu": true
 }

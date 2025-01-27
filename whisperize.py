@@ -46,15 +46,6 @@ class TranscriptBuffer:
             return ""
         return ' '.join(text.strip().split())
 
-    def _get_text_end(self, text: str) -> str:
-        """Safely get the end of a text string for comparison"""
-        if not isinstance(text, str) or not text:
-            return ""
-        words = text.split()
-        if not words:
-            return ""
-        return words[-1]
-
     def _is_duplicate(self, new_text: str, threshold: float = 0.8) -> bool:
         """Check if text is too similar to recent history"""
         new_text = self._clean_text(new_text)
@@ -62,89 +53,20 @@ class TranscriptBuffer:
             if self._similarity_ratio(new_text, self._clean_text(entry["text"])) > threshold:
                 return True
         return False
-        
-    def _should_merge_with_pending(self, new_segment: Dict) -> bool:
-        """Determine if new segment should be merged with pending segment"""
-        if not self.pending_segment or self.pending_segment["speaker"] != new_segment["speaker"]:
-            return False
-            
-        # Check if new segment completes a sentence from pending segment
-        pending_text = self._clean_text(self.pending_segment["text"])
-        new_text = self._clean_text(new_segment["text"])
-        
-        if not pending_text or not new_text:
-            return False
-            
-        # Check if pending text ends mid-word or without punctuation
-        last_char = self._get_text_end(pending_text)
-        ends_incomplete = last_char and not last_char[-1] in '.!?'
-        
-        # Check if texts overlap
-        pending_words = pending_text.split()[-3:] if pending_text else []
-        new_words = new_text.split()[:3] if new_text else []
-        
-        if not pending_words or not new_words:
-            return False
-            
-        overlap_ratio = self._similarity_ratio(
-            ' '.join(pending_words),
-            ' '.join(new_words)
-        )
-        
-        return ends_incomplete or overlap_ratio > self.merge_threshold
     
     def add_transcript(self, segment: Dict) -> Optional[Dict]:
-        """
-        Process and potentially add a transcript segment.
-        Returns the segment to be written, or None if it should be skipped.
-        """
+        """Process and add a transcript segment, with deduplication"""
         if self._is_duplicate(segment["text"]):
             return None
             
-        # Clean the text
         segment["text"] = self._clean_text(segment["text"])
         
-        # If text is too short, add to pending but don't output
-        if len(segment["text"].split()) < 3:
-            if self.pending_segment:
-                # If we already have a pending segment, try to merge
-                if self._should_merge_with_pending(segment):
-                    self.pending_segment["text"] += " " + segment["text"]
-                    return None
-            self.pending_segment = segment.copy()
-            return None
-            
-        # Check if we should merge with pending segment
-        if self.pending_segment and self._should_merge_with_pending(segment):
-            # Merge texts and use the longer timespan
-            merged_segment = {
-                "speaker": segment["speaker"],
-                "text": self._clean_text(self.pending_segment["text"] + " " + segment["text"]),
-                "start": min(self.pending_segment["start"], segment["start"]),
-                "end": max(self.pending_segment["end"], segment["end"])
-            }
-            self.pending_segment = None
-            
-            if not self._is_duplicate(merged_segment["text"]):
-                self.history.append(merged_segment)
-                if len(self.history) > self.max_history:
-                    self.history.pop(0)
-                return merged_segment
-            return None
-            
-        # Handle pending segment if it exists and we're not merging
-        output_segment = None
-        if self.pending_segment:
-            if len(self.pending_segment["text"].split()) >= 3:
-                output_segment = self.pending_segment
-            self.pending_segment = None
-            
         # Add new segment to history
         self.history.append(segment)
         if len(self.history) > self.max_history:
             self.history.pop(0)
             
-        return segment if not output_segment else output_segment
+        return segment
 
 class Speaker:
     """Thread-safe speaker state management"""
@@ -221,35 +143,23 @@ class DiarizationWorker(threading.Thread):
 class Whisperize:
     """Main application class for audio transcription and diarization"""
     def __init__(self, config_path: str = "config.json", input_source: Optional[str] = None):
-        # Load configuration
         with open(config_path) as f:
             self.config = json.load(f)
             if input_source:
                 self.config["input_source"] = input_source
 
-        # Create output directories
-        for dir_key in ["output_folder", "temp_folder"]:
-            os.makedirs(self.config[dir_key], exist_ok=True)
+        os.makedirs(self.config["output_folder"], exist_ok=True)
 
-        # Initialize components
         self._init_models()
         self._init_audio_settings()
         self._init_diarization()
         self._create_transcript_file()
         
-        # Initialize transcript buffer for deduplication
         self.transcript_buffer = TranscriptBuffer()
 
     def _init_models(self):
         """Initialize Whisper and diarization models"""
-
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
-
+        device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
         logging.info("Loading models...")
 
         whisper.torch.load = functools.partial(whisper.torch.load, weights_only=True)
@@ -271,8 +181,8 @@ class Whisperize:
             "channels": 1,
             "rate": 16000,
             "chunk": 1024,
-            "buffer_duration": 4,    # how often we analyze the audio
-            "buffer_overlap": 2      # seconds of overlap between buffers
+            "buffer_duration": 5,
+            "buffer_overlap": 2
         }
 
     def _init_diarization(self):
@@ -304,21 +214,16 @@ class Whisperize:
         logging.info(f"Transcript file: {self.transcript_path}")
 
     def transcribe(self, audio_buffer: np.ndarray) -> List[dict]:
-        # Prepare audio for Whisper (normalize to float32 in [-1, 1] range)
+        """Transcribe audio buffer and get speaker information"""
         waveform = torch.from_numpy(audio_buffer.astype(np.float32) / 32768.0).unsqueeze(0)
         timestamp = datetime.now().timestamp()
         
-        # Queue for diarization
         self.audio_queue.put(AudioChunk(waveform=waveform, timestamp=timestamp))
-        
-        # Get current speaker
         speaker, _ = self.speaker.current
         
-        # Pass the audio tensor directly to Whisper
         result = self.whisper.transcribe(
             audio=waveform.numpy().squeeze(), 
-            fp16=self.whisper.device.type != "cpu",
-            #language="it"
+            fp16=self.whisper.device.type != "cpu"
         )
         
         text = result["text"].strip()
@@ -374,11 +279,9 @@ class Whisperize:
                 buffer.extend(np.frombuffer(data, dtype=np.int16))
                 
                 if len(buffer) >= self.audio_config["buffer_duration"] * self.audio_config["rate"]:
-                    # Process the current buffer
                     transcript = self.transcribe(np.array(buffer))
                     self._write_transcript(transcript)
                     
-                    # Keep only the overlap portion for the next iteration
                     overlap_samples = self.audio_config["buffer_overlap"] * self.audio_config["rate"]
                     buffer = buffer[-overlap_samples:]
                     
@@ -392,7 +295,7 @@ class Whisperize:
             self.cleanup()
 
     def _write_transcript(self, segments: List[dict]) -> None:
-        """Write transcribed segments to file with smart merging and deduplication"""
+        """Write transcribed segments to file"""
         if not segments:
             return
 
