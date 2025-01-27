@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Dict, Optional, Generator
 from pyannote.audio import Pipeline
+from faster_whisper import WhisperModel
 import json
 import logging
 import numpy as np
@@ -13,12 +14,11 @@ import sys
 import threading
 import torch
 import wave
-import whisper
 import functools
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
-for logger in ["speechbrain", "pyannote"]:
+for logger in ["speechbrain", "pyannote","faster_whisper"]:
     logging.getLogger(logger).setLevel(logging.WARNING)
 
 @dataclass
@@ -199,12 +199,15 @@ class Whisperize:
     def _init_models(self):
         """Initialize Whisper and diarization models"""
         device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-        whisper.torch.load = functools.partial(whisper.torch.load, weights_only=True)
+        compute_type = "int8" if device == "cpu" else "int16"
         
-        self.whisper = whisper.load_model(
-            self.config.get("model", "base"), 
-            device = device if not self.config.get("whisper_force_cpu", False) else "cpu"
+        self.whisper = WhisperModel(
+            self.config.get("model", "base"),
+            device= "cpu" if self.config.get("whisper_force_cpu", False) else device ,
+            compute_type= "int8" if self.config.get("whisper_force_cpu", False) else compute_type
         )
+        #self.whisper.torch.load = functools.partial(whisper.torch.load, weights_only=True)
+        
         
         token = self.config.get("huggingface_token")
         if not token:
@@ -281,21 +284,24 @@ class Whisperize:
         self.audio_queue.put(AudioChunk(waveform=waveform, timestamp=timestamp))
         speaker, _ = self.speaker.current
         
-        result = self.whisper.transcribe(
-            audio=waveform.numpy().squeeze(),
+        segments, info = self.whisper.transcribe(
+            audio=audio_buffer,
             temperature=(0.0, 0.2, 0.4),
             compression_ratio_threshold=2.4,
-            logprob_threshold=-1.0,
             no_speech_threshold=0.6,
             condition_on_previous_text=True,
             initial_prompt=self.last_prompt,
             word_timestamps=True,
-            fp16=self.whisper.device.type != "cpu",
-            language=self.config.get('language', None)
+            beam_size=5,
+            language=self.config.get('language', None),
+            # vad_filter=True,
+            # vad_parameters=dict(min_silence_duration_ms=500),
         )
-        
-        text = result["text"].strip()
-        
+
+        logging.debug("Detected language '%s' with probability %f" % (info.language, info.language_probability))
+
+        text = " ".join([segment.text for segment in segments])
+
         if text:
             # Update the last prompt for better context in next transcription
             self.last_prompt = text[-200:] if len(text) > 200 else text

@@ -63,10 +63,6 @@ The application uses a `config.json` file for configuration. You can specify var
        "language": "it" //optional
     }
    ```
-## Tuning Parameters (TODO)
-
-English (default): onset/offset = 0.5, min_duration = 0.2
-Italian: onset/offset = 0.7, min_duration = 0.3
 
 ### Models
 
