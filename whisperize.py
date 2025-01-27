@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
 from typing import List, Dict, Optional
+from pyannote.audio import Pipeline
 import json
 import logging
 import numpy as np
@@ -13,9 +14,8 @@ import sys
 import threading
 import torch
 import wave
-
-from lightning_whisper_mlx import LightningWhisperMLX
-from pyannote.audio import Pipeline
+import whisper
+import functools
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -165,13 +165,11 @@ class Speaker:
 
 class Diarizer:
     """PyAnnote-based speaker diarization"""
-    def __init__(self, auth_token: str):
+    def __init__(self, auth_token: str, device: str = "cpu"):
         self.pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
             use_auth_token=auth_token
-        )
-        if torch.backends.mps.is_available():
-            self.pipeline.to(torch.device("mps"))
+        ).to(torch.device(device))
     
     def process(self, waveform: torch.Tensor, sample_rate: int) -> List[dict]:
         """Process audio for speaker diarization"""
@@ -244,17 +242,27 @@ class Whisperize:
 
     def _init_models(self):
         """Initialize Whisper and diarization models"""
+
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+
         logging.info("Loading models...")
-        self.whisper = LightningWhisperMLX(
-            model=self.config.get("model", "tiny"),
-            batch_size=self.config.get("batch_size", 12),
-            quant=self.config.get("quant", None)
+
+        whisper.torch.load = functools.partial(whisper.torch.load, weights_only=True)
+        
+        self.whisper = whisper.load_model(
+            self.config.get("model", "base"), 
+            device = device if not self.config.get("whisper_force_cpu", False) else "cpu"
         )
         
         token = self.config.get("huggingface_token")
         if not token:
             raise ValueError("HuggingFace token required in config.json")
-        self.diarizer = Diarizer(auth_token=token)
+        self.diarizer = Diarizer(auth_token=token, device=device)
 
     def _init_audio_settings(self):
         """Initialize audio processing settings"""
@@ -296,8 +304,7 @@ class Whisperize:
         logging.info(f"Transcript file: {self.transcript_path}")
 
     def transcribe(self, audio_buffer: np.ndarray) -> List[dict]:
-        """Transcribe audio buffer and update diarization"""
-        # Prepare audio for processing
+        # Prepare audio for Whisper (normalize to float32 in [-1, 1] range)
         waveform = torch.from_numpy(audio_buffer.astype(np.float32) / 32768.0).unsqueeze(0)
         timestamp = datetime.now().timestamp()
         
@@ -307,31 +314,23 @@ class Whisperize:
         # Get current speaker
         speaker, _ = self.speaker.current
         
-        # Create temporary file for Whisper
-        temp_file = os.path.join(self.config["temp_folder"], f"temp_{timestamp}.wav")
-        with wave.open(temp_file, 'wb') as wf:
-            wf.setnchannels(self.audio_config["channels"])
-            wf.setsampwidth(2)
-            wf.setframerate(self.audio_config["rate"])
-            wf.writeframes(audio_buffer.tobytes())
-
-        try:
-            result = self.whisper.transcribe(temp_file)
-            text = result["text"].strip()
-            
-            if text:
-                return [{
-                    "speaker": speaker or "SPEAKER_UNKNOWN",
-                    "text": text,
-                    "start": timestamp,
-                    "end": timestamp + len(audio_buffer) / self.audio_config["rate"]
-                }]
-        finally:
-            try:
-                os.remove(temp_file)
-            except OSError:
-                pass
-
+        # Pass the audio tensor directly to Whisper
+        result = self.whisper.transcribe(
+            audio=waveform.numpy().squeeze(), 
+            fp16=self.whisper.device.type != "cpu",
+            #language="it"
+        )
+        
+        text = result["text"].strip()
+        
+        if text:
+            return [{
+                "speaker": speaker or "SPEAKER_UNKNOWN",
+                "text": text,
+                "start": timestamp,
+                "end": timestamp + len(audio_buffer) / self.audio_config["rate"]
+            }]
+        
         return []
 
     def process_file(self, audio_path: str) -> None:
