@@ -264,6 +264,15 @@ class Whisperize:
         
         logging.info(f"Transcript file: {self.transcript_path}")
 
+    def is_silent(self, audio_buffer: np.ndarray, threshold: float = 0.01) -> bool:
+        """Check if the audio buffer contains silence based on RMS energy"""
+        if len(audio_buffer) == 0:
+            return True
+        # Convert to float32 for RMS calculation
+        float_buffer = audio_buffer.astype(np.float32) / 32768.0
+        rms = np.sqrt(np.mean(float_buffer ** 2))
+        return rms < threshold
+
     def transcribe(self, audio_buffer: np.ndarray) -> List[dict]:
         """Transcribe audio buffer with optimized Whisper parameters"""
         waveform = torch.from_numpy(audio_buffer.astype(np.float32) / 32768.0).unsqueeze(0)
@@ -305,16 +314,11 @@ class Whisperize:
         
         try:
             for chunk in self.audio_processor.process_file(audio_path):
-                if self.audio_buffer.add(chunk):
-                    buffer_data = self.audio_buffer.get()
-                    transcript = self.transcribe(buffer_data)
-                    self._write_transcript(transcript)
-            
-            # Process any remaining audio in buffer
-            if self.audio_buffer.buffer:
-                buffer_data = self.audio_buffer.get()
-                transcript = self.transcribe(buffer_data)
-                self._write_transcript(transcript)
+                if not self.is_silent(chunk):
+                    if self.audio_buffer.add(chunk):
+                        buffer_data = self.audio_buffer.get()
+                        transcript = self.transcribe(buffer_data)
+                        self._write_transcript(transcript)
                 
         except Exception as e:
             logging.error(f"Error processing file: {e}")
@@ -341,10 +345,11 @@ class Whisperize:
                 data = stream.read(self.audio_config["chunk"], exception_on_overflow=False)
                 chunk = np.frombuffer(data, dtype=np.int16)
                 
-                if self.audio_buffer.add(chunk):
-                    buffer_data = self.audio_buffer.get()
-                    transcript = self.transcribe(buffer_data)
-                    self._write_transcript(transcript)
+                if not self.is_silent(chunk):
+                    if self.audio_buffer.add(chunk):
+                        buffer_data = self.audio_buffer.get()
+                        transcript = self.transcribe(buffer_data)
+                        self._write_transcript(transcript)
                     
         except KeyboardInterrupt:
             logging.info("\nStopping...")

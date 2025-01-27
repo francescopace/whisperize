@@ -58,7 +58,7 @@ The application uses a `config.json` file for configuration. You can specify var
        "huggingface_token": "your_token_here",
        "output_folder": "transcripts/",
        "output_format": "text", //or json
-       "model": "base",
+       "model": "turbo",
        "whisper_force_cpu": false,
        "language": "it" //optional
     }
