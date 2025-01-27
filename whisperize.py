@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 from dataclasses import dataclass
 from datetime import datetime
-from difflib import SequenceMatcher
 from typing import List, Dict, Optional
 from pyannote.audio import Pipeline
 import json
@@ -28,46 +27,6 @@ class AudioChunk:
     waveform: torch.Tensor
     timestamp: float
 
-class TranscriptBuffer:
-    """Manages transcript history and deduplication with smart merging"""
-    def __init__(self, max_history: int = 5, merge_threshold: float = 0.5):
-        self.history: List[Dict] = []
-        self.max_history = max_history
-        self.merge_threshold = merge_threshold
-        self.pending_segment: Optional[Dict] = None
-    
-    def _similarity_ratio(self, text1: str, text2: str) -> float:
-        """Calculate similarity between two text segments"""
-        return SequenceMatcher(None, text1.lower(), text2.lower()).ratio()
-    
-    def _clean_text(self, text: str) -> str:
-        """Clean and normalize text for comparison"""
-        if not isinstance(text, str):
-            return ""
-        return ' '.join(text.strip().split())
-
-    def _is_duplicate(self, new_text: str, threshold: float = 0.8) -> bool:
-        """Check if text is too similar to recent history"""
-        new_text = self._clean_text(new_text)
-        for entry in self.history:
-            if self._similarity_ratio(new_text, self._clean_text(entry["text"])) > threshold:
-                return True
-        return False
-    
-    def add_transcript(self, segment: Dict) -> Optional[Dict]:
-        """Process and add a transcript segment, with deduplication"""
-        if self._is_duplicate(segment["text"]):
-            return None
-            
-        segment["text"] = self._clean_text(segment["text"])
-        
-        # Add new segment to history
-        self.history.append(segment)
-        if len(self.history) > self.max_history:
-            self.history.pop(0)
-            
-        return segment
-
 class Speaker:
     """Thread-safe speaker state management"""
     def __init__(self):
@@ -86,25 +45,59 @@ class Speaker:
             return self._current, self._timestamp
 
 class Diarizer:
-    """PyAnnote-based speaker diarization"""
+    """PyAnnote-based speaker diarization with optimized caching"""
     def __init__(self, auth_token: str, device: str = "cpu"):
+        # Set up cache directory
+        self.cache_dir = os.path.expanduser("~/.cache/pyannote")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        
+        # Initialize pipeline with caching
         self.pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
-            use_auth_token=auth_token
+            use_auth_token=auth_token,
+            cache_dir=self.cache_dir
         ).to(torch.device(device))
+        
+        # Store device for potential model movement
+        self.device = device
+        
+        # Minimum duration for processing (to avoid processing very short segments)
+        self.min_duration = 0.5  # seconds
+        
+        # Default parameters for diarization
+        self.default_params = {
+            "min_speakers": 1,
+            "max_speakers": 5
+        }
     
     def process(self, waveform: torch.Tensor, sample_rate: int) -> List[dict]:
-        """Process audio for speaker diarization"""
-        diarization = self.pipeline({"waveform": waveform, "sample_rate": sample_rate})
-        
-        return [
-            {
+        """Process audio for speaker diarization with optimizations"""
+        # Check if audio is too short
+        duration = waveform.shape[1] / sample_rate
+        if duration < self.min_duration:
+            return [{"speaker": "SPEAKER_00", "start": 0, "end": duration}]
+            
+        try:
+            # Move waveform to correct device if needed
+            if waveform.device != self.device:
+                waveform = waveform.to(self.device)
+            
+            # Process with optimized parameters
+            diarization = self.pipeline(
+                {"waveform": waveform, "sample_rate": sample_rate},
+                **self.default_params
+            )
+            
+            return [{
                 "speaker": label,
                 "start": segment.start,
                 "end": segment.end
-            }
-            for segment, _, label in diarization.itertracks(yield_label=True)
-        ]
+            } for segment, _, label in diarization.itertracks(yield_label=True)]
+            
+        except Exception as e:
+            logging.error(f"Diarization error: {e}")
+            # Fallback to single speaker in case of error
+            return [{"speaker": "SPEAKER_00", "start": 0, "end": duration}]
 
 class DiarizationWorker(threading.Thread):
     """Background worker for continuous diarization"""
@@ -154,14 +147,11 @@ class Whisperize:
         self._init_audio_settings()
         self._init_diarization()
         self._create_transcript_file()
-        
-        self.transcript_buffer = TranscriptBuffer()
+        self.last_prompt = None
 
     def _init_models(self):
         """Initialize Whisper and diarization models"""
         device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-        logging.info("Loading models...")
-
         whisper.torch.load = functools.partial(whisper.torch.load, weights_only=True)
         
         self.whisper = whisper.load_model(
@@ -172,7 +162,12 @@ class Whisperize:
         token = self.config.get("huggingface_token")
         if not token:
             raise ValueError("HuggingFace token required in config.json")
-        self.diarizer = Diarizer(auth_token=token, device=device)
+            
+        # Initialize diarizer
+        self.diarizer = Diarizer(
+            auth_token=token,
+            device=device
+        )
 
     def _init_audio_settings(self):
         """Initialize audio processing settings"""
@@ -181,8 +176,7 @@ class Whisperize:
             "channels": 1,
             "rate": 16000,
             "chunk": 1024,
-            "buffer_duration": 5,
-            "buffer_overlap": 2
+            "buffer_duration": 5,  # 5 seconds buffer
         }
 
     def _init_diarization(self):
@@ -214,7 +208,7 @@ class Whisperize:
         logging.info(f"Transcript file: {self.transcript_path}")
 
     def transcribe(self, audio_buffer: np.ndarray) -> List[dict]:
-        """Transcribe audio buffer and get speaker information"""
+        """Transcribe audio buffer with optimized Whisper parameters"""
         waveform = torch.from_numpy(audio_buffer.astype(np.float32) / 32768.0).unsqueeze(0)
         timestamp = datetime.now().timestamp()
         
@@ -222,13 +216,22 @@ class Whisperize:
         speaker, _ = self.speaker.current
         
         result = self.whisper.transcribe(
-            audio=waveform.numpy().squeeze(), 
+            audio=waveform.numpy().squeeze(),
+            temperature=(0.0, 0.2, 0.4),
+            compression_ratio_threshold=2.4,
+            logprob_threshold=-1.0,
+            no_speech_threshold=0.6,
+            condition_on_previous_text=True,
+            initial_prompt=self.last_prompt,
+            word_timestamps=True,
             fp16=self.whisper.device.type != "cpu"
         )
         
         text = result["text"].strip()
         
         if text:
+            # Update the last prompt for better context in next transcription
+            self.last_prompt = text[-200:] if len(text) > 200 else text
             return [{
                 "speaker": speaker or "SPEAKER_UNKNOWN",
                 "text": text,
@@ -253,8 +256,6 @@ class Whisperize:
         
         transcript = self.transcribe(audio_buffer)
         self._write_transcript(transcript)
-        
-        self.audio_queue.join()
         self.cleanup()
 
     def process_microphone(self) -> None:
@@ -281,9 +282,7 @@ class Whisperize:
                 if len(buffer) >= self.audio_config["buffer_duration"] * self.audio_config["rate"]:
                     transcript = self.transcribe(np.array(buffer))
                     self._write_transcript(transcript)
-                    
-                    overlap_samples = self.audio_config["buffer_overlap"] * self.audio_config["rate"]
-                    buffer = buffer[-overlap_samples:]
+                    buffer = []
                     
         except KeyboardInterrupt:
             logging.info("\nStopping...")
@@ -301,9 +300,8 @@ class Whisperize:
 
         with open(self.transcript_path, 'a') as f:
             for segment in segments:
-                processed_segment = self.transcript_buffer.add_transcript(segment)
-                if processed_segment:
-                    line = f'[{processed_segment["speaker"]}]: {processed_segment["text"]}\n'
+                if segment["text"].strip():
+                    line = f'[{segment["speaker"]}]: {segment["text"]}\n'
                     print(line, end='')
                     f.write(line)
 

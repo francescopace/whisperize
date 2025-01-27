@@ -64,7 +64,15 @@ The application uses a `config.json` file for configuration. You can specify var
    ```
 ### Models
 
-see [https://github.com/openai/whisper?tab=readme-ov-file#available-models-and-languages](https://github.com/openai/whisper?tab=readme-ov-file#available-models-and-languages)
+Transcribe with the following models: [https://github.com/openai/whisper?tab=readme-ov-file#available-models-and-languages](https://github.com/openai/whisper?tab=readme-ov-file#available-models-and-languages)
+
+Diarize with the following models:
+ - pyannote/overlapped-speech-detection
+ - pyannote/speaker-diarization
+ - pyannote/speaker-segmentation
+ - pyannote/voice-activity-detection
+ - pyannote/speaker-diarization-3.0
+ - pyannote/speaker-diarization-3.1
 
 ## Usage
 
