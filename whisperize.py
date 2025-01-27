@@ -263,8 +263,8 @@ class Whisperize:
             "channels": 1,
             "rate": 16000,
             "chunk": 1024,
-            "buffer_duration": 5,    # 5 seconds buffer
-            "buffer_overlap": 1      # 1 second overlap (reduced from 2)
+            "buffer_duration": 4,    # how often we analyze the audio
+            "buffer_overlap": 2      # seconds of overlap between buffers
         }
 
     def _init_diarization(self):
