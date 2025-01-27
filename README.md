@@ -80,7 +80,7 @@ The default batch_size is 12, higher is better for throughput but you might run 
 
 To run the application, use the following command:
 ```bash
-python whisperize.py --source <>
+python whisperize.py <source>
 ```
 Replace `<source>` with the desired sourcey (default is `microphone`). It can be a file path.
 
