@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Generator
 from pyannote.audio import Pipeline
 import json
 import logging
@@ -26,6 +26,53 @@ class AudioChunk:
     """Audio chunk with its timestamp for diarization"""
     waveform: torch.Tensor
     timestamp: float
+
+class AudioBuffer:
+    """Handles audio buffer processing for both file and stream input"""
+    def __init__(self, sample_rate: int, buffer_duration: float = 5.0):
+        self.sample_rate = sample_rate
+        self.buffer_duration = buffer_duration
+        self.buffer_size = int(sample_rate * buffer_duration)
+        self.reset()
+    
+    def reset(self):
+        """Reset buffer state"""
+        self.buffer = []
+        
+    def add(self, data: np.ndarray) -> bool:
+        """Add data to buffer and return True if buffer is full"""
+        self.buffer.extend(data)
+        return len(self.buffer) >= self.buffer_size
+    
+    def get(self) -> np.ndarray:
+        """Get current buffer content and reset"""
+        data = np.array(self.buffer[:self.buffer_size], dtype=np.int16)
+        self.buffer = self.buffer[self.buffer_size:]
+        return data
+
+class AudioProcessor:
+    """Handles both file and stream audio processing"""
+    def __init__(self, sample_rate: int, channels: int = 1):
+        self.sample_rate = sample_rate
+        self.channels = channels
+        
+    def process_file(self, file_path: str) -> Generator[np.ndarray, None, None]:
+        """Process audio file in chunks"""
+        with wave.open(file_path, 'rb') as wf:
+            # Validate audio format
+            if wf.getframerate() != self.sample_rate:
+                logging.warning(f"Sample rate mismatch: {wf.getframerate()} Hz vs {self.sample_rate} Hz")
+            
+            chunk_size = int(self.sample_rate)  # 1-second chunks
+            while True:
+                frames = wf.readframes(chunk_size)
+                if not frames:
+                    break
+                    
+                audio_chunk = np.frombuffer(frames, dtype=np.int16)
+                if wf.getnchannels() == 2:
+                    audio_chunk = audio_chunk.reshape(-1, 2).mean(axis=1).astype(np.int16)
+                yield audio_chunk
 
 class Speaker:
     """Thread-safe speaker state management"""
@@ -61,7 +108,7 @@ class Diarizer:
         # Store device for potential model movement
         self.device = device
         
-        # Minimum duration for processing (to avoid processing very short segments)
+        # Minimum duration for processing
         self.min_duration = 0.5  # seconds
         
         # Default parameters for diarization
@@ -178,6 +225,16 @@ class Whisperize:
             "chunk": 1024,
             "buffer_duration": 5,  # 5 seconds buffer
         }
+        
+        self.audio_buffer = AudioBuffer(
+            sample_rate=self.audio_config["rate"],
+            buffer_duration=self.audio_config["buffer_duration"]
+        )
+        
+        self.audio_processor = AudioProcessor(
+            sample_rate=self.audio_config["rate"],
+            channels=self.audio_config["channels"]
+        )
 
     def _init_diarization(self):
         """Initialize diarization components"""
@@ -243,21 +300,26 @@ class Whisperize:
         return []
 
     def process_file(self, audio_path: str) -> None:
-        """Process a single audio file"""
+        """Process audio file using the same buffering approach as streaming"""
         logging.info(f"Processing {audio_path}...")
         
-        with wave.open(audio_path, 'rb') as wf:
-            audio_buffer = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+        try:
+            for chunk in self.audio_processor.process_file(audio_path):
+                if self.audio_buffer.add(chunk):
+                    buffer_data = self.audio_buffer.get()
+                    transcript = self.transcribe(buffer_data)
+                    self._write_transcript(transcript)
             
-            if wf.getframerate() != self.audio_config["rate"]:
-                logging.warning(f"Sample rate mismatch: {wf.getframerate()} Hz vs {self.audio_config['rate']} Hz")
-            
-            if wf.getnchannels() == 2:
-                audio_buffer = audio_buffer.reshape(-1, 2).mean(axis=1).astype(np.int16)
-        
-        transcript = self.transcribe(audio_buffer)
-        self._write_transcript(transcript)
-        self.cleanup()
+            # Process any remaining audio in buffer
+            if self.audio_buffer.buffer:
+                buffer_data = self.audio_buffer.get()
+                transcript = self.transcribe(buffer_data)
+                self._write_transcript(transcript)
+                
+        except Exception as e:
+            logging.error(f"Error processing file: {e}")
+        finally:
+            self.cleanup()
 
     def process_microphone(self) -> None:
         """Process real-time audio from microphone"""
@@ -275,15 +337,14 @@ class Whisperize:
             
             logging.info("Listening... Press Ctrl+C to stop.")
             
-            buffer = []
             while True:
                 data = stream.read(self.audio_config["chunk"], exception_on_overflow=False)
-                buffer.extend(np.frombuffer(data, dtype=np.int16))
+                chunk = np.frombuffer(data, dtype=np.int16)
                 
-                if len(buffer) >= self.audio_config["buffer_duration"] * self.audio_config["rate"]:
-                    transcript = self.transcribe(np.array(buffer))
+                if self.audio_buffer.add(chunk):
+                    buffer_data = self.audio_buffer.get()
+                    transcript = self.transcribe(buffer_data)
                     self._write_transcript(transcript)
-                    buffer = []
                     
         except KeyboardInterrupt:
             logging.info("\nStopping...")
