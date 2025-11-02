@@ -1,5 +1,5 @@
 {
-    "huggingface_token": "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",
+    "huggingface_token": "your_huggingface_token_here",
     "output_folder": "transcripts/",
     "output_format": "text",
     "model": "turbo",
