@@ -1,9 +1,12 @@
 .venv
 .cache
+.env
 transcripts
 tmp
 inputs
 mlx_models
+config.local.json
+*.segments.jsonl
 __pycache__
 *.pyc
 .DS_Store

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Generator
+from typing import Any, Generator, List, Optional
 import json
 import logging
 import numpy as np
@@ -23,24 +23,56 @@ for logger in ["speechbrain", "pyannote", "faster_whisper"]:
 class AudioBuffer:
     def __init__(self, sample_rate: int, buffer_duration: float = 5.0):
         self.sample_rate = sample_rate
-        self.buffer_size = int(sample_rate * buffer_duration)
-        self.buffer = []
+        self.buffer_size = max(1, int(sample_rate * buffer_duration))
         self.max_buffer_size = self.buffer_size * 3  # Prevent unbounded growth
+        self.buffer = np.zeros(self.max_buffer_size, dtype=np.int16)
+        self._read_pos = 0
+        self._write_pos = 0
+        self._count = 0
         
     def add(self, data: np.ndarray) -> bool:
-        self.buffer.extend(data)
+        samples = np.asarray(data, dtype=np.int16).ravel()
+        if samples.size == 0:
+            return self._count >= self.buffer_size
+
+        # If incoming chunk is larger than max buffer, keep only the latest part.
+        if samples.size >= self.max_buffer_size:
+            samples = samples[-self.max_buffer_size:]
+            self._read_pos = 0
+            self._write_pos = 0
+            self._count = 0
+
+        overflow = self._count + samples.size - self.max_buffer_size
+        if overflow > 0:
+            # Drop oldest samples to preserve newest audio under backpressure.
+            self._read_pos = (self._read_pos + overflow) % self.max_buffer_size
+            self._count -= overflow
+            logging.warning(f"AudioBuffer overflow: trimmed {overflow} samples")
+
+        first_write = min(samples.size, self.max_buffer_size - self._write_pos)
+        self.buffer[self._write_pos:self._write_pos + first_write] = samples[:first_write]
+        remaining = samples.size - first_write
+        if remaining > 0:
+            self.buffer[:remaining] = samples[first_write:]
+
+        self._write_pos = (self._write_pos + samples.size) % self.max_buffer_size
+        self._count += samples.size
         
-        # Prevent memory leak: trim buffer if it grows too large
-        if len(self.buffer) > self.max_buffer_size:
-            excess = len(self.buffer) - self.max_buffer_size
-            self.buffer = self.buffer[excess:]
-            logging.warning(f"AudioBuffer overflow: trimmed {excess} samples")
-        
-        return len(self.buffer) >= self.buffer_size
+        return self._count >= self.buffer_size
     
     def get(self) -> np.ndarray:
-        data = np.array(self.buffer[:self.buffer_size], dtype=np.int16)
-        self.buffer = self.buffer[self.buffer_size:]
+        if self._count < self.buffer_size:
+            return np.array([], dtype=np.int16)
+
+        data = np.empty(self.buffer_size, dtype=np.int16)
+        first_read = min(self.buffer_size, self.max_buffer_size - self._read_pos)
+        data[:first_read] = self.buffer[self._read_pos:self._read_pos + first_read]
+        remaining = self.buffer_size - first_read
+        if remaining > 0:
+            data[first_read:] = self.buffer[:remaining]
+
+        self._read_pos = (self._read_pos + self.buffer_size) % self.max_buffer_size
+        self._count -= self.buffer_size
         return data
     
 @dataclass
@@ -82,9 +114,6 @@ class AudioProcessor:
         
     def process_file(self, file_path: str) -> Generator[np.ndarray, None, None]:
         with wave.open(file_path, 'rb') as wf:
-            if wf.getframerate() != self.sample_rate:
-                logging.warning(f"Sample rate mismatch: {wf.getframerate()} Hz vs {self.sample_rate} Hz")
-            
             chunk_size = int(self.sample_rate)
             while True:
                 frames = wf.readframes(chunk_size)
@@ -158,33 +187,34 @@ class DiarizationWorker(threading.Thread):
         self.max_retries = 3
         self.retry_delay = 1.0
 
+    def _process_chunk(self, chunk: AudioChunk, retries: int) -> None:
+        for attempt in range(retries):
+            try:
+                results = self.diarizer.process(
+                    audio_buffer=chunk.audio_buffer,
+                    sample_rate=self.sample_rate
+                )
+
+                if results:
+                    latest = results[-1]
+                    self.speaker.update(latest["speaker"], chunk.timestamp)
+                return
+
+            except Exception as e:
+                if attempt < retries - 1:
+                    logging.warning(f"Diarization attempt {attempt + 1} failed: {e}. Retrying...")
+                    self.stop_event.wait(self.retry_delay)
+                else:
+                    logging.error(f"Diarization failed after {retries} attempts: {e}")
+
     def run(self):
         while not self.stop_event.is_set():
             try:
                 chunk = self.diarization_queue.get(timeout=1.0)
                 if chunk is None:  # Sentinel value
                     break
-                
-                # Retry logic for diarization
-                for attempt in range(self.max_retries):
-                    try:
-                        results = self.diarizer.process(
-                            audio_buffer=chunk.audio_buffer,
-                            sample_rate=self.sample_rate
-                        )
-                        
-                        if results:
-                            latest = results[-1]
-                            self.speaker.update(latest["speaker"], chunk.timestamp)
-                        break  # Success, exit retry loop
-                        
-                    except Exception as e:
-                        if attempt < self.max_retries - 1:
-                            logging.warning(f"Diarization attempt {attempt + 1} failed: {e}. Retrying...")
-                            self.stop_event.wait(self.retry_delay)
-                        else:
-                            logging.error(f"Diarization failed after {self.max_retries} attempts: {e}")
-                
+
+                self._process_chunk(chunk, retries=self.max_retries)
                 self.diarization_queue.task_done()
                 
             except queue.Empty:
@@ -198,16 +228,7 @@ class DiarizationWorker(threading.Thread):
                 chunk = self.diarization_queue.get_nowait()
                 if chunk is None:
                     break
-                try:
-                    results = self.diarizer.process(
-                        audio_buffer=chunk.audio_buffer,
-                        sample_rate=self.sample_rate
-                    )
-                    if results:
-                        latest = results[-1]
-                        self.speaker.update(latest["speaker"], chunk.timestamp)
-                except Exception as e:
-                    logging.error(f"Error processing remaining chunk: {e}")
+                self._process_chunk(chunk, retries=1)
                 self.diarization_queue.task_done()
             except queue.Empty:
                 break
@@ -227,6 +248,55 @@ class TranscriptionWorker(threading.Thread):
         self.write_transcript_func = write_transcript_func
         self.max_retries = 3
         self.retry_delay = 1.0
+        self.transcribe_options = self._build_transcribe_options()
+
+    def _build_transcribe_options(self) -> dict[str, Any]:
+        default_temperature = (0.0, 0.2, 0.4)
+        configured_temperature = self.config.get("temperature", default_temperature)
+        if isinstance(configured_temperature, (list, tuple)):
+            try:
+                temperatures = tuple(float(value) for value in configured_temperature)
+            except (TypeError, ValueError):
+                temperatures = default_temperature
+        else:
+            temperatures = default_temperature
+
+        beam_size = self.config.get("beam_size", 5)
+        try:
+            beam_size = int(beam_size)
+        except (TypeError, ValueError):
+            beam_size = 5
+
+        return {
+            "temperature": temperatures,
+            "compression_ratio_threshold": 2.4,
+            "no_speech_threshold": 0.6,
+            "condition_on_previous_text": True,
+            "word_timestamps": True,
+            "beam_size": max(1, beam_size),
+            "language": self.config.get("language")
+        }
+
+    def _transcribe(self, audio_buffer: np.ndarray):
+        return self.whisper.transcribe(
+            audio=audio_buffer,
+            initial_prompt=self.last_prompt,
+            **self.transcribe_options
+        )
+
+    def _process_chunk(self, chunk: AudioChunk, retries: int) -> None:
+        for attempt in range(retries):
+            try:
+                segments, _ = self._transcribe(chunk.audio_buffer)
+                processed_segments = self.process_segments(segments, chunk.timestamp)
+                self.write_transcript_func(processed_segments)
+                return
+            except Exception as e:
+                if attempt < retries - 1:
+                    logging.warning(f"Transcription attempt {attempt + 1} failed: {e}. Retrying...")
+                    self.stop_event.wait(self.retry_delay)
+                else:
+                    logging.error(f"Transcription failed after {retries} attempts: {e}")
 
     def run(self):
         while not self.stop_event.is_set():
@@ -234,33 +304,8 @@ class TranscriptionWorker(threading.Thread):
                 chunk = self.transcription_queue.get(timeout=1.0)
                 if chunk is None:  # Sentinel value
                     break
-                
-                # Retry logic for transcription
-                for attempt in range(self.max_retries):
-                    try:
-                        segments, _ = self.whisper.transcribe(
-                            audio=chunk.audio_buffer,
-                            temperature=(0.0, 0.2, 0.4),
-                            compression_ratio_threshold=2.4,
-                            no_speech_threshold=0.6,
-                            condition_on_previous_text=True,
-                            initial_prompt=self.last_prompt,
-                            word_timestamps=True,
-                            beam_size=5,
-                            language=self.config.get('language', None)
-                        )
-                        
-                        processed_segments = self.process_segments(segments, chunk.timestamp)
-                        self.write_transcript_func(processed_segments)
-                        break  # Success, exit retry loop
-                        
-                    except Exception as e:
-                        if attempt < self.max_retries - 1:
-                            logging.warning(f"Transcription attempt {attempt + 1} failed: {e}. Retrying...")
-                            self.stop_event.wait(self.retry_delay)
-                        else:
-                            logging.error(f"Transcription failed after {self.max_retries} attempts: {e}")
-                
+
+                self._process_chunk(chunk, retries=self.max_retries)
                 self.transcription_queue.task_done()
             except queue.Empty:
                 continue
@@ -273,22 +318,7 @@ class TranscriptionWorker(threading.Thread):
                 chunk = self.transcription_queue.get_nowait()
                 if chunk is None:
                     break
-                try:
-                    segments, _ = self.whisper.transcribe(
-                        audio=chunk.audio_buffer,
-                        temperature=(0.0, 0.2, 0.4),
-                        compression_ratio_threshold=2.4,
-                        no_speech_threshold=0.6,
-                        condition_on_previous_text=True,
-                        initial_prompt=self.last_prompt,
-                        word_timestamps=True,
-                        beam_size=5,
-                        language=self.config.get('language', None)
-                    )
-                    processed_segments = self.process_segments(segments, chunk.timestamp)
-                    self.write_transcript_func(processed_segments)
-                except Exception as e:
-                    logging.error(f"Error processing remaining chunk: {e}")
+                self._process_chunk(chunk, retries=1)
                 self.transcription_queue.task_done()
             except queue.Empty:
                 break
@@ -341,8 +371,12 @@ class TranscriptionWorker(threading.Thread):
         self.stop_event.set()
 
 class Whisperize:
-    def __init__(self, config_path: str = "config.json", input_source: str = None):
-        with open(config_path) as f:
+    def __init__(self, config_path: Optional[str] = None, input_source: str = None):
+        resolved_config_path = config_path or (
+            "config.local.json" if os.path.exists("config.local.json") else "config.json"
+        )
+
+        with open(resolved_config_path) as f:
             self.config = json.load(f)
             if input_source:
                 self.config["input_source"] = input_source
@@ -352,21 +386,31 @@ class Whisperize:
         
         os.makedirs(self.config["output_folder"], exist_ok=True)
         self.timestamp_manager = TimestampManager()
-        self.json_segments = []  # Store segments for JSON output
-        self.json_segments_lock = threading.Lock()  # Thread-safe access
+        self.queue_put_lock = threading.Lock()
+        self.transcript_lock = threading.Lock()
+        self.json_write_lock = threading.Lock()
+        self.transcript_file: Optional[Any] = None
+        self.json_segments_path: Optional[str] = None
         self._init_models()
         self._init_audio()
         self._init_transcript()
     
     def _validate_config(self) -> None:
         """Validate configuration parameters."""
-        # Validate HuggingFace token
-        token = self.config.get("huggingface_token", "")
-        if not token or token == "your_huggingface_token_here":
+        # Validate HuggingFace token from environment.
+        config_token = self.config.get("huggingface_token", "")
+        token = os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN")
+        if not token:
             raise ValueError(
-                "Invalid HuggingFace token in config.json. "
-                "Please set a valid token from https://huggingface.co/settings/tokens"
+                "HuggingFace token not found. "
+                "Set HUGGINGFACE_TOKEN (or HF_TOKEN) in your environment."
             )
+        if config_token and config_token != "your_huggingface_token_here":
+            logging.warning(
+                "Ignoring huggingface_token in config file. "
+                "Use HUGGINGFACE_TOKEN/HF_TOKEN environment variable instead."
+            )
+        self.config["huggingface_token"] = token
         
         # Validate buffer_duration
         buffer_duration = self.config.get("buffer_duration")
@@ -386,17 +430,19 @@ class Whisperize:
             raise ValueError(f"Invalid output_format: {output_format}. Must be 'text' or 'json'.")
 
     def _init_models(self):
-        device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+        default_device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+        force_cpu = self.config.get("whisper_force_cpu", False)
+        device = "cpu" if force_cpu else default_device
         
         self.whisper = WhisperModel(
             self.config.get("model", "base"),
-            device="cpu" if self.config.get("whisper_force_cpu", False) else device,
-            compute_type="int8" if self.config.get("whisper_force_cpu", False) or device == "cpu" else "float16"
+            device=device,
+            compute_type="int8" if device == "cpu" else "float16"
         )
         
         token = self.config.get("huggingface_token")
         if not token:
-            raise ValueError("HuggingFace token required in config.json")
+            raise ValueError("HuggingFace token required from environment variables")
             
         self.diarizer = Diarizer(auth_token=token, device=device)
         self.diarization_queue = queue.Queue(maxsize=100)
@@ -439,8 +485,13 @@ class Whisperize:
         )
         
         try:
-            with open(self.transcript_path, 'w') as f:
-                f.write(f"# Transcript started at {datetime.now()}\n\n")
+            self.transcript_file = open(self.transcript_path, 'w', encoding='utf-8', buffering=1)
+            self.transcript_file.write(f"# Transcript started at {datetime.now()}\n\n")
+
+            if self.config.get("output_format") == "json":
+                self.json_segments_path = self.transcript_path.replace('.txt', '.segments.jsonl')
+                with open(self.json_segments_path, 'w', encoding='utf-8'):
+                    pass
             logging.info(f"Transcript file: {self.transcript_path}")
         except IOError as e:
             raise IOError(f"Failed to create transcript file at {self.transcript_path}: {e}")
@@ -453,24 +504,23 @@ class Whisperize:
 
         float_buffer = audio_buffer.astype(np.float32) / 32768.0
         filtered_buffer = np.diff(float_buffer, prepend=float_buffer[0])
-        
-        window_size = min(1024, len(filtered_buffer))
-        windows = filtered_buffer[:len(filtered_buffer) - (len(filtered_buffer) % window_size)]
-        windows = windows.reshape(-1, window_size)
-        
-        rms_values = np.sqrt(np.mean(windows ** 2, axis=1))
-        return not np.any(rms_values > threshold)
+        rms = np.sqrt(np.mean(filtered_buffer ** 2))
+        return rms <= threshold
 
     def process_audio_chunk(self, audio_chunk: np.ndarray):
         buffer_timestamp = datetime.now().timestamp()
         audio_data = AudioChunk(audio_buffer=audio_chunk, timestamp=buffer_timestamp)
         
-        # Use put with timeout to avoid blocking indefinitely if queue is full
-        try:
-            self.diarization_queue.put(audio_data, timeout=5.0)
-            self.transcription_queue.put(audio_data, timeout=5.0)
-        except queue.Full:
-            logging.warning("Queue full, dropping audio chunk to prevent blocking")
+        # Keep diarization/transcription queues aligned.
+        with self.queue_put_lock:
+            if self.diarization_queue.full() or self.transcription_queue.full():
+                logging.warning("Queue full, dropping audio chunk to keep worker queues aligned")
+                return
+            try:
+                self.diarization_queue.put_nowait(audio_data)
+                self.transcription_queue.put_nowait(audio_data)
+            except queue.Full:
+                logging.warning("Queue became full while enqueueing; dropped chunk to avoid desync")
 
     def _write_transcript(self, segments: List[dict]) -> None:
         """Write transcript in text or JSON format based on config."""
@@ -478,72 +528,95 @@ class Whisperize:
             return
 
         output_format = self.config.get("output_format", "text")
-        
-        # Store segments for JSON output (thread-safe)
-        if output_format == "json":
-            with self.json_segments_lock:
-                self.json_segments.extend(segments)
-        
-        # Always write text output for real-time display
-        with open(self.transcript_path, 'a') as f:
+
+        with self.transcript_lock:
+            if not self.transcript_file:
+                return
+
             for segment in segments:
                 if segment["text"].strip():
                     # Calculate relative time for better readability
                     relative_start = self.timestamp_manager.get_relative_time(segment["start"])
                     relative_end = self.timestamp_manager.get_relative_time(segment["end"])
-                    
+
                     start_time = self.timestamp_manager.format_timestamp(relative_start, use_relative=True)
                     end_time = self.timestamp_manager.format_timestamp(relative_end, use_relative=True)
-                    
+
                     line = f'[{start_time}-{end_time}] [{segment["speaker"]}]: {segment["text"]}\n'
                     print(line, end='')
-                    f.write(line)
+                    self.transcript_file.write(line)
+
+        if output_format == "json" and self.json_segments_path:
+            with self.json_write_lock:
+                with open(self.json_segments_path, 'a', encoding='utf-8') as f:
+                    for segment in segments:
+                        if segment["text"].strip():
+                            f.write(json.dumps(self._build_json_segment(segment), ensure_ascii=False))
+                            f.write("\n")
+
+    def _build_json_segment(self, segment: dict) -> dict:
+        relative_start = self.timestamp_manager.get_relative_time(segment["start"])
+        relative_end = self.timestamp_manager.get_relative_time(segment["end"])
+        return {
+            "speaker": segment["speaker"],
+            "start": round(relative_start, 3),
+            "end": round(relative_end, 3),
+            "text": segment["text"],
+            "words": [
+                {
+                    "word": word["word"],
+                    "start": round(self.timestamp_manager.get_relative_time(word["start"]), 3),
+                    "end": round(self.timestamp_manager.get_relative_time(word["end"]), 3),
+                    "probability": round(word["probability"], 3)
+                }
+                for word in segment.get("words", [])
+            ]
+        }
     
     def _save_json_transcript(self) -> None:
         """Save transcript in JSON format."""
-        if not self.json_segments:
+        if not self.json_segments_path or not os.path.exists(self.json_segments_path):
             return
         
         json_path = self.transcript_path.replace('.txt', '.json')
-        
-        # Prepare JSON structure with metadata
-        transcript_data = {
-            "metadata": {
-                "start_time": datetime.fromtimestamp(self.timestamp_manager.start_time).isoformat(),
-                "duration": self.timestamp_manager.get_relative_time(datetime.now().timestamp()),
-                "model": self.config.get("model", "base"),
-                "language": self.config.get("language", "auto"),
-                "source": self.config.get("input_source", "microphone")
-            },
-            "segments": []
+
+        metadata = {
+            "start_time": datetime.fromtimestamp(self.timestamp_manager.start_time).isoformat(),
+            "duration": self.timestamp_manager.get_relative_time(datetime.now().timestamp()),
+            "model": self.config.get("model", "base"),
+            "language": self.config.get("language", "auto"),
+            "source": self.config.get("input_source", "microphone")
         }
-        
-        # Convert segments to JSON-friendly format with relative timestamps
-        for segment in self.json_segments:
-            relative_start = self.timestamp_manager.get_relative_time(segment["start"])
-            relative_end = self.timestamp_manager.get_relative_time(segment["end"])
-            
-            json_segment = {
-                "speaker": segment["speaker"],
-                "start": round(relative_start, 3),
-                "end": round(relative_end, 3),
-                "text": segment["text"],
-                "words": [
-                    {
-                        "word": word["word"],
-                        "start": round(self.timestamp_manager.get_relative_time(word["start"]), 3),
-                        "end": round(self.timestamp_manager.get_relative_time(word["end"]), 3),
-                        "probability": round(word["probability"], 3)
-                    }
-                    for word in segment.get("words", [])
-                ]
-            }
-            transcript_data["segments"].append(json_segment)
-        
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(transcript_data, f, ensure_ascii=False, indent=2)
+
+        with self.json_write_lock:
+            with open(json_path, 'w', encoding='utf-8') as out:
+                out.write("{\n")
+                out.write('  "metadata": ')
+                out.write(json.dumps(metadata, ensure_ascii=False, indent=2).replace("\n", "\n  "))
+                out.write(",\n")
+                out.write('  "segments": [\n')
+
+                first = True
+                with open(self.json_segments_path, 'r', encoding='utf-8') as segments_file:
+                    for line in segments_file:
+                        payload = line.strip()
+                        if not payload:
+                            continue
+                        if not first:
+                            out.write(",\n")
+                        out.write("    ")
+                        out.write(payload)
+                        first = False
+
+                out.write("\n  ]\n")
+                out.write("}\n")
         
         logging.info(f"JSON transcript saved to: {json_path}")
+
+        try:
+            os.remove(self.json_segments_path)
+        except OSError:
+            logging.warning(f"Could not remove temporary JSON segments file: {self.json_segments_path}")
 
     def process_file(self, audio_path: str) -> None:
         """Process audio file with validation."""
@@ -562,6 +635,10 @@ class Whisperize:
                     raise ValueError(f"Unsupported number of channels: {wf.getnchannels()}")
                 if wf.getsampwidth() != 2:  # 16-bit
                     raise ValueError(f"Unsupported sample width: {wf.getsampwidth()} bytes (expected 2)")
+                if wf.getframerate() != 16000:
+                    raise ValueError(
+                        f"Unsupported sample rate: {wf.getframerate()} Hz (expected 16000 Hz)."
+                    )
         except wave.Error as e:
             raise ValueError(f"Invalid WAV file: {e}")
         
@@ -575,8 +652,8 @@ class Whisperize:
                         self.process_audio_chunk(buffer_data)
             
             # Add sentinel value to signal end of processing
-            self.transcription_queue.put(None)
-            self.diarization_queue.put(None)
+            self._try_put_sentinel(self.transcription_queue, "transcription")
+            self._try_put_sentinel(self.diarization_queue, "diarization")
             
             # Wait for the workers to finish with timeout
             timeout = 30.0
@@ -630,20 +707,23 @@ class Whisperize:
     def cleanup(self) -> None:
         """Gracefully shutdown worker threads with timeout."""
         timeout = 10.0  # seconds
+        workers_still_running = False
         
-        if hasattr(self, 'diarization_worker'):
+        if hasattr(self, 'diarization_worker') and self.diarization_worker.is_alive():
             self.diarization_worker.stop()
-            self.diarization_queue.put(None)  # Add sentinel for diarization worker
+            self._try_put_sentinel(self.diarization_queue, "diarization")
             self.diarization_worker.join(timeout=timeout)
             if self.diarization_worker.is_alive():
                 logging.warning("Diarization worker did not terminate within timeout")
+                workers_still_running = True
         
-        if hasattr(self, 'transcription_worker'):
+        if hasattr(self, 'transcription_worker') and self.transcription_worker.is_alive():
             self.transcription_worker.stop()
-            self.transcription_queue.put(None)  # Ensure sentinel is added even if stop() is called
+            self._try_put_sentinel(self.transcription_queue, "transcription")
             self.transcription_worker.join(timeout=timeout)
             if self.transcription_worker.is_alive():
                 logging.warning("Transcription worker did not terminate within timeout")
+                workers_still_running = True
         
         for q in [self.diarization_queue, self.transcription_queue]:
             while not q.empty():
@@ -654,7 +734,26 @@ class Whisperize:
         
         # Save JSON transcript if configured
         if self.config.get("output_format") == "json":
-            self._save_json_transcript()
+            if workers_still_running:
+                logging.warning("Skipping JSON export because workers are still running")
+            else:
+                self._save_json_transcript()
+
+        if self.transcript_file:
+            if workers_still_running:
+                self.transcript_file.flush()
+            else:
+                self.transcript_file.close()
+                self.transcript_file = None
+
+    def _try_put_sentinel(self, target_queue: queue.Queue, queue_name: str) -> None:
+        try:
+            target_queue.put(None, timeout=0.2)
+        except queue.Full:
+            logging.warning(
+                f"{queue_name.capitalize()} queue full during shutdown; "
+                "relying on stop event to terminate worker"
+            )
 
 def main():
     input_source = sys.argv[1] if len(sys.argv) > 1 else "microphone"

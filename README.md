@@ -50,23 +50,36 @@ pip install -r requirements.txt
 ### 4. Configure the Application
 1. Create a HuggingFace account at [https://huggingface.co/](https://huggingface.co/)
 2. Generate an access token at [https://huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
-3. Edit `config.json` and update with your settings:
+3. Export the token in your shell (recommended to avoid committing secrets):
+
+```bash
+export HUGGINGFACE_TOKEN="your_token_here"
+```
+
+4. Create a local config file and update with your settings:
+
+```bash
+cp config.example.json config.local.json
+```
+
+`config.local.json` is ignored by git and automatically preferred over `config.json` if present.
 
 ```json
 {
-    "huggingface_token": "your_token_here",
     "output_folder": "transcripts/",
     "output_format": "text",
     "model": "turbo",
     "whisper_force_cpu": false,
     "language": "it",
-    "buffer_duration": 4
+    "buffer_duration": 4,
+    "beam_size": 5,
+    "temperature": [0.0, 0.2, 0.4]
 }
 ```
 
 #### Configuration Parameters
 
-- **huggingface_token** (required): Your HuggingFace API token for accessing PyAnnote models
+- **HUGGINGFACE_TOKEN / HF_TOKEN** (required env var): HuggingFace API token used to access PyAnnote models
 - **output_folder** (required): Directory where transcripts will be saved
 - **output_format** (optional): Output format - `"text"` or `"json"` (default: `"text"`)
   - `text`: Creates a human-readable transcript with timestamps
@@ -75,6 +88,8 @@ pip install -r requirements.txt
 - **whisper_force_cpu** (optional): Force CPU usage even if GPU/MPS is available (default: `false`)
 - **language** (optional): Language code (e.g., `"it"`, `"en"`, `"es"`). If not specified, language is auto-detected
 - **buffer_duration** (optional): Audio buffer duration in seconds (default: `5.0`)
+- **beam_size** (optional): Beam size for Whisper decoding (default: `5`)
+- **temperature** (optional): Temperature schedule used by Whisper (default: `[0.0, 0.2, 0.4]`)
 
 ### Supported Models
 
@@ -108,7 +123,7 @@ python whisperize.py microphone
 python whisperize.py path/to/audio.wav
 ```
 
-**Note:** Only WAV files (16-bit, mono or stereo) are currently supported.
+**Note:** Only WAV files (16-bit, **16kHz**, mono or stereo) are currently supported.
 
 ### Output
 

@@ -4,5 +4,7 @@
     "model": "turbo",
     "whisper_force_cpu": true,
     "language": "it",
-    "buffer_duration": 4
+    "buffer_duration": 4,
+    "beam_size": 5,
+    "temperature": [0.0, 0.2, 0.4]
 }
