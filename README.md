@@ -3,7 +3,7 @@
 A Python application for real-time audio transcription and speaker diarization using Faster-Whisper and PyAnnote.
 
 ## Features
-- Real-time audio transcription with Apple Silicon support (MPS)
+- Real-time audio transcription
 - Advanced speaker diarization using PyAnnote
 - Support for microphone and audio file input
 - Multiple Whisper model sizes and quantization options
@@ -12,19 +12,34 @@ A Python application for real-time audio transcription and speaker diarization u
 
 ## Requirements
 
-- Python 3.10
-- FFmpeg (required for audio processing)
-  ```bash
-  # On macOS using Homebrew
-  brew install ffmpeg
+- Python 3.12
+- System dependencies:
+  - **macOS (Homebrew)**:
+    ```bash
+    brew install ffmpeg portaudio
+    ```
+  - **Ubuntu/Debian**:
+    ```bash
+    sudo apt-get install ffmpeg portaudio19-dev
+    ```
+  - **Windows (Chocolatey)**:
+    ```bash
+    choco install ffmpeg
+    ```
+    For microphone input, install PortAudio binaries/development headers and ensure they are available in your build environment.
 
-  # On Ubuntu/Debian
-  sudo apt-get install ffmpeg
+### Runtime note (macOS)
 
-  # On Windows using Chocolatey
-  choco install ffmpeg
-  ```
-- Apple Silicon Mac recommended for optimal performance with MPS acceleration
+If you still see duplicate FFmpeg Objective-C warnings at startup, it usually means
+different FFmpeg builds are loaded at the same time (e.g. Homebrew + wheel-bundled FFmpeg).
+
+```bash
+brew install pkg-config ffmpeg
+pip uninstall -y av
+PKG_CONFIG_PATH="$(brew --prefix ffmpeg)/lib/pkgconfig" pip install --no-binary av av
+```
+
+This rebuilds `av` against your system FFmpeg and is the most reliable way to reduce those warnings.
 
 ## Installation
 

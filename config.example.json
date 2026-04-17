@@ -2,7 +2,7 @@
     "output_folder": "transcripts/",
     "output_format": "text",
     "model": "turbo",
-    "whisper_force_cpu": true,
+    "whisper_force_cpu": false,
     "language": "it",
     "buffer_duration": 4,
     "beam_size": 5,

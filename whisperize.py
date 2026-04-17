@@ -6,12 +6,22 @@ import json
 import logging
 import numpy as np
 import os
+import warnings
 import pyaudio
 import queue
 import sys
 import threading
 import torch
 import wave
+
+# pyannote 4.x can emit a very verbose warning when torchcodec/ffmpeg
+# integration is incomplete. Keep logs focused on actionable errors.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*torchcodec is not installed correctly so built-in audio decoding will fail.*",
+    category=UserWarning
+)
+
 from pyannote.audio import Pipeline
 from faster_whisper import WhisperModel
 
@@ -151,7 +161,7 @@ class Diarizer:
         
         self.pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
-            use_auth_token=auth_token,
+            token=auth_token,
             cache_dir=self.cache_dir
         ).to(torch.device(device))
         
@@ -432,19 +442,39 @@ class Whisperize:
     def _init_models(self):
         default_device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
         force_cpu = self.config.get("whisper_force_cpu", False)
-        device = "cpu" if force_cpu else default_device
-        
+        diarizer_device = "cpu" if force_cpu else default_device
+
+        # faster-whisper (CTranslate2) does not support Apple MPS yet.
+        whisper_device = "cpu" if force_cpu else ("cuda" if torch.cuda.is_available() else "cpu")
+        if not force_cpu and default_device == "mps":
+            logging.warning(
+                "MPS detected but faster-whisper does not support it; "
+                "falling back to CPU for transcription."
+            )
+
         self.whisper = WhisperModel(
             self.config.get("model", "base"),
-            device=device,
-            compute_type="int8" if device == "cpu" else "float16"
+            device=whisper_device,
+            compute_type="int8" if whisper_device == "cpu" else "float16"
         )
         
         token = self.config.get("huggingface_token")
         if not token:
             raise ValueError("HuggingFace token required from environment variables")
             
-        self.diarizer = Diarizer(auth_token=token, device=device)
+        try:
+            self.diarizer = Diarizer(auth_token=token, device=diarizer_device)
+        except Exception as e:
+            error_text = str(e).lower()
+            mps_related_error = "mps" in error_text or "unsupported device" in error_text
+            if diarizer_device == "mps" and mps_related_error:
+                logging.warning(
+                    f"Diarization does not support MPS in this setup ({e}); "
+                    "falling back to CPU."
+                )
+                self.diarizer = Diarizer(auth_token=token, device="cpu")
+            else:
+                raise
         self.diarization_queue = queue.Queue(maxsize=100)
         self.transcription_queue = queue.Queue(maxsize=100)
         self.speaker = Speaker()
