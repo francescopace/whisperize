@@ -1,15 +1,18 @@
 # Whisperize
 
-Real-time audio transcription with speaker diarization, optimized for Apple Silicon.
-Uses [MLX Whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) for transcription and [PyAnnote](https://github.com/pyannote/pyannote-audio) for speaker identification.
+Whisperize transcribes audio in real time — from a microphone or a WAV file — and automatically identifies **who is speaking**.
+
+When multiple people talk in a recording, transcribing the words is not enough: you need to know which words belong to which speaker. This process is called *speaker diarization*. Whisperize combines [MLX Whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) for transcription and [PyAnnote](https://github.com/pyannote/pyannote-audio) for diarization, producing structured output with timestamps and labels for each speaker.
+
+Optimized for **macOS on Apple Silicon** — all models run locally with MLX acceleration.
 
 ## Features
 
-- Live microphone and WAV file transcription
-- Speaker diarization (who said what)
+- Live transcription from microphone and WAV files
+- Automatic speaker recognition (speaker diarization)
 - Multiple Whisper model sizes with MLX acceleration
-- Text and JSON output formats
-- Offline-first: runs from local model cache after initial download
+- Text and JSON output with timestamps and confidence scores
+- Offline-first: after the initial download, everything runs locally
 
 ## Requirements
 
@@ -82,7 +85,7 @@ cp config.example.json config.local.json
 | `diarization_min_speakers` | `null` | Optional lower bound for diarization speaker count |
 | `diarization_max_speakers` | `null` | Optional upper bound for diarization speaker count |
 
-For fixed-speaker test clips (like your generated 3-speaker sample), set both values to `3` to stabilize clustering.
+With both values set to `null`, speaker count is estimated automatically.
 
 ## Models
 

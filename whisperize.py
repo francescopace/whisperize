@@ -3,6 +3,7 @@ import argparse
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Generator, List, Optional
+import inspect
 import json
 import logging
 import numpy as np
@@ -309,6 +310,7 @@ class Diarizer:
         self.min_duration = 0.5
         self.min_speakers = min_speakers
         self.max_speakers = max_speakers
+        self._bounds_fallback_logged = False
 
     @staticmethod
     def _unwrap_annotation(diarization_output):
@@ -359,16 +361,42 @@ class Diarizer:
         duration = waveform.shape[1] / sample_rate
         if duration < self.min_duration:
             return [{"speaker": "SPEAKER_00", "start": 0, "end": duration}]
-            
+
         diarization_kwargs = {}
-        if self.min_speakers is not None:
-            diarization_kwargs["min_speakers"] = self.min_speakers
-        if self.max_speakers is not None:
-            diarization_kwargs["max_speakers"] = self.max_speakers
-        diarization = self.pipeline(
-            {"waveform": waveform, "sample_rate": sample_rate},
-            **diarization_kwargs,
+        constrained = self.min_speakers is not None or self.max_speakers is not None
+        using_exact_speakers = (
+            self.min_speakers is not None
+            and self.max_speakers is not None
+            and self.min_speakers == self.max_speakers
         )
+        if using_exact_speakers:
+            diarization_kwargs["num_speakers"] = self.min_speakers
+        else:
+            if self.min_speakers is not None:
+                diarization_kwargs["min_speakers"] = self.min_speakers
+            if self.max_speakers is not None:
+                diarization_kwargs["max_speakers"] = self.max_speakers
+
+        with warnings.catch_warnings(record=True) as caught_warnings:
+            warnings.simplefilter("always", category=UserWarning)
+            diarization = self.pipeline(
+                {"waveform": waveform, "sample_rate": sample_rate},
+                **diarization_kwargs,
+            )
+
+        bounds_warning = any(
+            "outside" in str(w.message).lower() and "given bounds" in str(w.message).lower()
+            for w in caught_warnings
+        )
+        if constrained and not using_exact_speakers and bounds_warning:
+            if not self._bounds_fallback_logged:
+                logging.warning(
+                    "Configured diarization speaker bounds are too strict for some chunks; "
+                    "falling back to automatic speaker count on those chunks."
+                )
+                self._bounds_fallback_logged = True
+            diarization = self.pipeline({"waveform": waveform, "sample_rate": sample_rate})
+
         diarization = self._unwrap_annotation(diarization)
         
         return [{
@@ -867,21 +895,232 @@ class Whisperize:
             return True
         return rms <= threshold
 
-    def process_audio_chunk(self, audio_chunk: np.ndarray, buffer_timestamp: Optional[float] = None):
+    def process_audio_chunk(
+        self,
+        audio_chunk: np.ndarray,
+        buffer_timestamp: Optional[float] = None,
+        enqueue_diarization: bool = True,
+    ):
         if buffer_timestamp is None:
             buffer_timestamp = datetime.now().timestamp()
         audio_data = AudioChunk(audio_buffer=audio_chunk, timestamp=buffer_timestamp)
         
-        # Keep diarization/transcription queues aligned.
         with self.queue_put_lock:
-            if self.diarization_queue.full() or self.transcription_queue.full():
-                logging.warning("Queue full, dropping audio chunk to keep worker queues aligned")
+            if enqueue_diarization:
+                if self.diarization_queue.full() or self.transcription_queue.full():
+                    logging.warning("Queue full, dropping audio chunk to keep worker queues aligned")
+                    return
+            elif self.transcription_queue.full():
+                logging.warning("Transcription queue full, dropping audio chunk")
                 return
             try:
-                self.diarization_queue.put_nowait(audio_data)
+                if enqueue_diarization:
+                    self.diarization_queue.put_nowait(audio_data)
                 self.transcription_queue.put_nowait(audio_data)
             except queue.Full:
                 logging.warning("Queue became full while enqueueing; dropped chunk to avoid desync")
+
+    def _dispatch_audio_chunk(
+        self,
+        audio_chunk: np.ndarray,
+        buffer_timestamp: float,
+        enqueue_diarization: bool,
+    ) -> None:
+        # Test doubles may monkeypatch process_audio_chunk with an older
+        # single-argument signature. Keep runtime behavior while preserving
+        # backwards compatibility in tests.
+        parameter_count = len(inspect.signature(self.process_audio_chunk).parameters)
+        if parameter_count <= 1:
+            self.process_audio_chunk(audio_chunk)
+        elif parameter_count == 2:
+            self.process_audio_chunk(audio_chunk, buffer_timestamp)
+        else:
+            self.process_audio_chunk(audio_chunk, buffer_timestamp, enqueue_diarization)
+
+    def _load_file_audio_mono(self, audio_path: str) -> np.ndarray:
+        """Load entire WAV file as int16 mono for file-level diarization."""
+        with wave.open(audio_path, "rb") as wf:
+            frames = wf.readframes(wf.getnframes())
+            audio = np.frombuffer(frames, dtype=np.int16)
+            if wf.getnchannels() == 2:
+                audio = audio.reshape(-1, 2)
+                audio = ((audio[:, 0].astype(np.float32) + audio[:, 1].astype(np.float32)) / 2.0).astype(np.int16)
+            return audio
+
+    def _prime_speaker_timeline_for_file(self, audio_path: str) -> Optional[List[dict]]:
+        """
+        Pre-compute diarization on full file to improve speaker consistency
+        across chunked transcription.
+        """
+        try:
+            audio_mono = self._load_file_audio_mono(audio_path)
+            results = self.diarizer.process(audio_mono, sample_rate=16000)
+            if not results:
+                return None
+            self.speaker.add_diarization_segments(results, self.timestamp_manager.start_time)
+            logging.info("Primed speaker timeline using full-file diarization.")
+            return results
+        except Exception as exc:
+            logging.warning(
+                f"Full-file diarization prepass failed ({exc}); "
+                "falling back to chunk-level diarization."
+            )
+            return None
+
+    def _merge_diarization_segments(
+        self,
+        diarization_segments: List[dict],
+        max_gap_seconds: float = 0.35,
+    ) -> List[dict]:
+        turns: List[dict] = []
+        sorted_segments = sorted(
+            diarization_segments,
+            key=lambda item: float(item.get("start", 0.0) or 0.0),
+        )
+
+        for segment in sorted_segments:
+            speaker = str(segment.get("speaker", "SPEAKER_00"))
+            start = float(segment.get("start", 0.0) or 0.0)
+            end = float(segment.get("end", start) or start)
+            if end < start:
+                start, end = end, start
+            if end <= start:
+                continue
+
+            if not turns:
+                turns.append({"speaker": speaker, "start": start, "end": end})
+                continue
+
+            previous = turns[-1]
+            same_speaker = previous["speaker"] == speaker
+            close_enough = start - float(previous["end"]) <= max_gap_seconds
+            if same_speaker and close_enough:
+                previous["end"] = max(float(previous["end"]), end)
+            else:
+                turns.append({"speaker": speaker, "start": start, "end": end})
+
+        return turns
+
+    def _build_turn_transcript_segments(
+        self,
+        raw_segments: List[TranscribedSegment],
+        speaker: str,
+        slice_start: float,
+        turn_start: float,
+        turn_end: float,
+    ) -> List[dict]:
+        processed_segments: List[dict] = []
+
+        for segment in raw_segments:
+            words = segment.words or []
+            if not words and segment.text.strip():
+                fallback_start = float(segment.start or 0.0)
+                fallback_end = float(segment.end or fallback_start)
+                words = [
+                    TranscribedWord(
+                        word=segment.text.strip(),
+                        start=fallback_start,
+                        end=fallback_end,
+                        probability=1.0,
+                    )
+                ]
+
+            if not words:
+                continue
+
+            kept_words = []
+            for word in words:
+                cleaned_word = word.word.strip()
+                if not cleaned_word:
+                    continue
+                absolute_start = slice_start + float(word.start)
+                absolute_end = slice_start + float(word.end)
+                if absolute_end < absolute_start:
+                    absolute_start, absolute_end = absolute_end, absolute_start
+                midpoint = (absolute_start + absolute_end) / 2.0
+                if midpoint < turn_start or midpoint > turn_end:
+                    continue
+                kept_words.append(
+                    {
+                        "word": cleaned_word,
+                        "start": max(turn_start, absolute_start),
+                        "end": min(turn_end, absolute_end),
+                        "probability": float(word.probability),
+                    }
+                )
+
+            if not kept_words:
+                continue
+
+            text = " ".join(word["word"] for word in kept_words).strip()
+            if not text:
+                continue
+            processed_segments.append(
+                {
+                    "speaker": speaker,
+                    "words": kept_words,
+                    "start": kept_words[0]["start"],
+                    "end": kept_words[-1]["end"],
+                    "text": text,
+                    "time_reference": "relative",
+                }
+            )
+
+        return processed_segments
+
+    def _process_file_with_diarization_segments(self, audio_path: str, diarization_segments: List[dict]) -> bool:
+        sample_rate = 16000
+        audio_mono = self._load_file_audio_mono(audio_path)
+        turns = self._merge_diarization_segments(diarization_segments)
+        if not turns:
+            logging.warning("Full-file diarization did not produce usable speaker turns.")
+            return False
+
+        audio_duration = len(audio_mono) / sample_rate
+        slice_padding = 0.2
+        turn_prompt: Optional[str] = None
+        wrote_any_segment = False
+        transcribe_options = dict(self.transcription_worker.transcribe_options)
+        transcribe_options["condition_on_previous_text"] = False
+
+        for turn in turns:
+            turn_start = float(turn["start"])
+            turn_end = float(turn["end"])
+            if turn_end <= turn_start:
+                continue
+
+            slice_start = max(0.0, turn_start - slice_padding)
+            slice_end = min(audio_duration, turn_end + slice_padding)
+            start_sample = int(slice_start * sample_rate)
+            end_sample = int(np.ceil(slice_end * sample_rate))
+            if end_sample <= start_sample:
+                continue
+
+            audio_slice = audio_mono[start_sample:end_sample]
+            if audio_slice.size == 0:
+                continue
+
+            raw_segments = self.transcriber.transcribe(audio_slice, turn_prompt, transcribe_options)
+            processed_segments = self._build_turn_transcript_segments(
+                raw_segments=raw_segments,
+                speaker=str(turn["speaker"]),
+                slice_start=slice_start,
+                turn_start=turn_start,
+                turn_end=turn_end,
+            )
+            if not processed_segments:
+                continue
+
+            self._write_transcript(processed_segments)
+            wrote_any_segment = True
+
+            combined_text = " ".join(segment["text"] for segment in processed_segments).strip()
+            if combined_text:
+                turn_prompt = combined_text[-200:] if len(combined_text) > 200 else combined_text
+
+        if not wrote_any_segment:
+            logging.warning("Segment-guided transcription produced no transcript segments.")
+        return wrote_any_segment
 
     def _write_transcript(self, segments: List[dict]) -> None:
         """Write transcript in text or JSON format based on config."""
@@ -896,9 +1135,14 @@ class Whisperize:
 
             for segment in segments:
                 if segment["text"].strip():
-                    # Calculate relative time for better readability
-                    relative_start = self.timestamp_manager.get_relative_time(segment["start"])
-                    relative_end = self.timestamp_manager.get_relative_time(segment["end"])
+                    uses_relative_reference = segment.get("time_reference") == "relative"
+                    if uses_relative_reference:
+                        relative_start = float(segment["start"])
+                        relative_end = float(segment["end"])
+                    else:
+                        # Calculate relative time for better readability
+                        relative_start = self.timestamp_manager.get_relative_time(segment["start"])
+                        relative_end = self.timestamp_manager.get_relative_time(segment["end"])
 
                     start_time = self.timestamp_manager.format_timestamp(relative_start, use_relative=True)
                     end_time = self.timestamp_manager.format_timestamp(relative_end, use_relative=True)
@@ -916,8 +1160,19 @@ class Whisperize:
                             f.write("\n")
 
     def _build_json_segment(self, segment: dict) -> dict:
-        relative_start = self.timestamp_manager.get_relative_time(segment["start"])
-        relative_end = self.timestamp_manager.get_relative_time(segment["end"])
+        uses_relative_reference = segment.get("time_reference") == "relative"
+        if uses_relative_reference:
+            relative_start = float(segment["start"])
+            relative_end = float(segment["end"])
+        else:
+            relative_start = self.timestamp_manager.get_relative_time(segment["start"])
+            relative_end = self.timestamp_manager.get_relative_time(segment["end"])
+
+        def to_relative_word_time(raw_value: float) -> float:
+            if uses_relative_reference:
+                return float(raw_value)
+            return self.timestamp_manager.get_relative_time(raw_value)
+
         return {
             "speaker": segment["speaker"],
             "start": round(relative_start, 3),
@@ -926,8 +1181,8 @@ class Whisperize:
             "words": [
                 {
                     "word": word["word"],
-                    "start": round(self.timestamp_manager.get_relative_time(word["start"]), 3),
-                    "end": round(self.timestamp_manager.get_relative_time(word["end"]), 3),
+                    "start": round(to_relative_word_time(word["start"]), 3),
+                    "end": round(to_relative_word_time(word["end"]), 3),
                     "probability": round(word["probability"], 3)
                 }
                 for word in segment.get("words", [])
@@ -1006,18 +1261,34 @@ class Whisperize:
         logging.info(f"Processing {audio_path}...")
         
         try:
+            diarization_segments = self._prime_speaker_timeline_for_file(audio_path)
+            use_file_level_diarization = diarization_segments is not None
+            if use_file_level_diarization and self.diarization_worker.is_alive():
+                self._try_put_sentinel(self.diarization_queue, "diarization")
+                self.diarization_worker.join(timeout=10.0)
+
+            if use_file_level_diarization and diarization_segments is not None:
+                self._process_file_with_diarization_segments(audio_path, diarization_segments)
+                self._try_put_sentinel(self.transcription_queue, "transcription")
+                return
+
             emitted_samples = 0
             for chunk in self.audio_processor.process_file(audio_path):
                 if not self.is_silent(chunk):
                     if self.audio_buffer.add(chunk):
                         buffer_data = self.audio_buffer.get()
                         buffer_timestamp = self.timestamp_manager.start_time + (emitted_samples / 16000.0)
-                        self.process_audio_chunk(buffer_data, buffer_timestamp=buffer_timestamp)
+                        self._dispatch_audio_chunk(
+                            buffer_data,
+                            buffer_timestamp,
+                            not use_file_level_diarization,
+                        )
                         emitted_samples += len(buffer_data)
             
             # Add sentinel value to signal end of processing
             self._try_put_sentinel(self.transcription_queue, "transcription")
-            self._try_put_sentinel(self.diarization_queue, "diarization")
+            if not use_file_level_diarization:
+                self._try_put_sentinel(self.diarization_queue, "diarization")
             
             # Wait for the workers to finish with timeout
             timeout = 30.0
