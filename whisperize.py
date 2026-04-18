@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+import argparse
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Generator, List, Optional
@@ -21,14 +22,35 @@ warnings.filterwarnings(
     message=r".*torchcodec is not installed correctly so built-in audio decoding will fail.*",
     category=UserWarning
 )
-
-from pyannote.audio import Pipeline
-from faster_whisper import WhisperModel
+# pyannote internals can emit these NumPy warnings on short/edge segments.
+# They are noisy and do not change transcription/diarization outputs.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Mean of empty slice.*",
+    category=RuntimeWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*invalid value encountered in divide.*",
+    category=RuntimeWarning,
+)
 
 # Simplified logging configuration
 logging.basicConfig(level=logging.INFO)
-for logger in ["speechbrain", "pyannote", "faster_whisper"]:
+for logger in ["speechbrain", "pyannote"]:
     logging.getLogger(logger).setLevel(logging.WARNING)
+
+DEFAULT_CONFIG = {
+    "output_folder": "transcripts/",
+    "output_format": "text",
+    "model": "turbo",
+    "language": None,
+    "buffer_duration": 4.0,
+    "temperature": [0.0, 0.2, 0.4],
+    "model_cache_dir": ".model_cache",
+    "diarization_min_speakers": None,
+    "diarization_max_speakers": None,
+}
 
 class AudioBuffer:
     def __init__(self, sample_rate: int, buffer_duration: float = 5.0):
@@ -90,6 +112,71 @@ class AudioChunk:
     audio_buffer: np.ndarray
     timestamp: float  # Absolute timestamp (epoch time)
 
+
+@dataclass
+class TranscribedWord:
+    word: str
+    start: float
+    end: float
+    probability: float
+
+
+@dataclass
+class TranscribedSegment:
+    text: str
+    words: List[TranscribedWord]
+    start: Optional[float] = None
+    end: Optional[float] = None
+
+
+class MlxWhisperTranscriber:
+    def __init__(self, model_repo: str, module: Any):
+        self.model_repo = model_repo
+        self.module = module
+
+    def transcribe(self, audio_buffer: np.ndarray, initial_prompt: Optional[str], options: dict[str, Any]) -> List[TranscribedSegment]:
+        audio_float = np.asarray(audio_buffer, dtype=np.float32) / 32768.0
+        transcribe_kwargs = {
+            "path_or_hf_repo": self.model_repo,
+            "language": options.get("language"),
+            "initial_prompt": initial_prompt,
+            "word_timestamps": True,
+            "temperature": options.get("temperature", (0.0, 0.2, 0.4)),
+            "condition_on_previous_text": options.get("condition_on_previous_text", True),
+            "no_speech_threshold": options.get("no_speech_threshold", 0.6),
+            "compression_ratio_threshold": options.get("compression_ratio_threshold", 2.4),
+        }
+
+        result = self.module.transcribe(audio_float, **transcribe_kwargs)
+        return _normalize_segments_from_dict(result.get("segments", []))
+
+
+def _normalize_segments_from_dict(segments: List[dict]) -> List[TranscribedSegment]:
+    normalized_segments: List[TranscribedSegment] = []
+    for segment in segments:
+        words: List[TranscribedWord] = []
+        for word in segment.get("words", []):
+            cleaned = (word.get("word", "") or "").strip()
+            if not cleaned:
+                continue
+            words.append(
+                TranscribedWord(
+                    word=cleaned,
+                    start=float(word.get("start", 0.0)),
+                    end=float(word.get("end", 0.0)),
+                    probability=float(word.get("probability", word.get("confidence", 0.0)) or 0.0),
+                )
+            )
+        normalized_segments.append(
+            TranscribedSegment(
+                text=(segment.get("text", "") or "").strip(),
+                words=words,
+                start=float(segment.get("start", 0.0) or 0.0),
+                end=float(segment.get("end", 0.0) or 0.0),
+            )
+        )
+    return normalized_segments
+
 class TimestampManager:
     """Manages absolute and relative timestamps for audio processing."""
     def __init__(self):
@@ -143,11 +230,39 @@ class Speaker:
         self._lock = threading.Lock()
         self._current = "SPEAKER_00"
         self._timestamp = 0
+        self._segments: list[tuple[float, float, str]] = []
+        self._history_seconds = 300.0
 
     def update(self, speaker: str, timestamp: float) -> None:
         with self._lock:
             self._current = speaker
             self._timestamp = timestamp
+
+    def add_diarization_segments(self, segments: List[dict], chunk_timestamp: float) -> None:
+        with self._lock:
+            for segment in segments:
+                speaker = str(segment.get("speaker", "SPEAKER_00"))
+                rel_start = float(segment.get("start", 0.0) or 0.0)
+                rel_end = float(segment.get("end", rel_start) or rel_start)
+                abs_start = chunk_timestamp + rel_start
+                abs_end = chunk_timestamp + rel_end
+                if abs_end < abs_start:
+                    abs_start, abs_end = abs_end, abs_start
+
+                self._segments.append((abs_start, abs_end, speaker))
+                if abs_end >= self._timestamp:
+                    self._current = speaker
+                    self._timestamp = abs_end
+
+            cutoff = chunk_timestamp - self._history_seconds
+            self._segments = [seg for seg in self._segments if seg[1] >= cutoff]
+
+    def get_speaker_for_timestamp(self, timestamp: float) -> str:
+        with self._lock:
+            for start, end, speaker in reversed(self._segments):
+                if start <= timestamp <= end:
+                    return speaker
+            return self._current
 
     @property
     def current(self) -> tuple[str, float]:
@@ -155,18 +270,89 @@ class Speaker:
             return self._current, self._timestamp
 
 class Diarizer:
-    def __init__(self, auth_token: str, device: str = "cpu"):
-        self.cache_dir = os.path.expanduser("~/.cache/pyannote")
+    def __init__(
+        self,
+        auth_token: Optional[str],
+        device: str = "cpu",
+        cache_dir: Optional[str] = None,
+        pipeline_source: str = "pyannote/speaker-diarization-3.1",
+        local_files_only: bool = False,
+        min_speakers: Optional[int] = None,
+        max_speakers: Optional[int] = None,
+    ):
+        self.cache_dir = cache_dir or os.path.expanduser("~/.cache/pyannote")
         os.makedirs(self.cache_dir, exist_ok=True)
-        
-        self.pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            token=auth_token,
-            cache_dir=self.cache_dir
-        ).to(torch.device(device))
+
+        from_pretrained_kwargs = {
+            "token": auth_token,
+            "cache_dir": self.cache_dir,
+        }
+        if local_files_only:
+            # Avoid HF metadata/network checks when cache is already hydrated.
+            from_pretrained_kwargs["local_files_only"] = True
+
+        try:
+            from pyannote.audio import Pipeline
+            self.pipeline = Pipeline.from_pretrained(
+                pipeline_source,
+                **from_pretrained_kwargs
+            ).to(torch.device(device))
+        except TypeError:
+            # Backward compatibility in case local_files_only is unsupported.
+            from_pretrained_kwargs.pop("local_files_only", None)
+            self.pipeline = Pipeline.from_pretrained(
+                pipeline_source,
+                **from_pretrained_kwargs
+            ).to(torch.device(device))
         
         self.device = device
         self.min_duration = 0.5
+        self.min_speakers = min_speakers
+        self.max_speakers = max_speakers
+
+    @staticmethod
+    def _unwrap_annotation(diarization_output):
+        """Normalize pyannote outputs to an Annotation-like object."""
+        current = diarization_output
+
+        # pyannote output shapes changed across versions. Walk through common
+        # wrapper attributes/keys until we reach an object exposing itertracks().
+        for _ in range(4):
+            if hasattr(current, "itertracks"):
+                return current
+
+            unwrapped = None
+            for attr_name in (
+                "speaker_diarization",
+                "exclusive_speaker_diarization",
+                "diarization",
+                "annotation",
+            ):
+                if hasattr(current, attr_name):
+                    candidate = getattr(current, attr_name)
+                    unwrapped = candidate() if callable(candidate) else candidate
+                    break
+
+            if unwrapped is None and isinstance(current, dict):
+                for key in (
+                    "speaker_diarization",
+                    "exclusive_speaker_diarization",
+                    "diarization",
+                    "annotation",
+                ):
+                    if key in current:
+                        unwrapped = current[key]
+                        break
+
+            if unwrapped is None:
+                break
+
+            current = unwrapped
+
+        raise TypeError(
+            "Unsupported diarization output type; expected an Annotation-like object "
+            f"with itertracks(), got {type(current).__name__}."
+        )
         
     def process(self, audio_buffer: np.ndarray, sample_rate: int) -> List[dict]:
         waveform = torch.from_numpy(audio_buffer.astype(np.float32) / 32768.0).unsqueeze(0).to(self.device)
@@ -174,11 +360,16 @@ class Diarizer:
         if duration < self.min_duration:
             return [{"speaker": "SPEAKER_00", "start": 0, "end": duration}]
             
+        diarization_kwargs = {}
+        if self.min_speakers is not None:
+            diarization_kwargs["min_speakers"] = self.min_speakers
+        if self.max_speakers is not None:
+            diarization_kwargs["max_speakers"] = self.max_speakers
         diarization = self.pipeline(
             {"waveform": waveform, "sample_rate": sample_rate},
-            min_speakers=1,
-            max_speakers=5
+            **diarization_kwargs,
         )
+        diarization = self._unwrap_annotation(diarization)
         
         return [{
             "speaker": label,
@@ -206,8 +397,7 @@ class DiarizationWorker(threading.Thread):
                 )
 
                 if results:
-                    latest = results[-1]
-                    self.speaker.update(latest["speaker"], chunk.timestamp)
+                    self.speaker.add_diarization_segments(results, chunk.timestamp)
                 return
 
             except Exception as e:
@@ -247,9 +437,9 @@ class DiarizationWorker(threading.Thread):
         self.stop_event.set()
 
 class TranscriptionWorker(threading.Thread):
-    def __init__(self, whisper: WhisperModel, transcription_queue: queue.Queue, speaker: Speaker, config: dict, write_transcript_func):
+    def __init__(self, transcriber: Any, transcription_queue: queue.Queue, speaker: Speaker, config: dict, write_transcript_func):
         super().__init__()
-        self.whisper = whisper
+        self.transcriber = transcriber
         self.transcription_queue = transcription_queue
         self.speaker = speaker
         self.stop_event = threading.Event()
@@ -271,33 +461,22 @@ class TranscriptionWorker(threading.Thread):
         else:
             temperatures = default_temperature
 
-        beam_size = self.config.get("beam_size", 5)
-        try:
-            beam_size = int(beam_size)
-        except (TypeError, ValueError):
-            beam_size = 5
-
         return {
             "temperature": temperatures,
             "compression_ratio_threshold": 2.4,
             "no_speech_threshold": 0.6,
             "condition_on_previous_text": True,
             "word_timestamps": True,
-            "beam_size": max(1, beam_size),
             "language": self.config.get("language")
         }
 
     def _transcribe(self, audio_buffer: np.ndarray):
-        return self.whisper.transcribe(
-            audio=audio_buffer,
-            initial_prompt=self.last_prompt,
-            **self.transcribe_options
-        )
+        return self.transcriber.transcribe(audio_buffer, self.last_prompt, self.transcribe_options)
 
     def _process_chunk(self, chunk: AudioChunk, retries: int) -> None:
         for attempt in range(retries):
             try:
-                segments, _ = self._transcribe(chunk.audio_buffer)
+                segments = self._transcribe(chunk.audio_buffer)
                 processed_segments = self.process_segments(segments, chunk.timestamp)
                 self.write_transcript_func(processed_segments)
                 return
@@ -336,36 +515,59 @@ class TranscriptionWorker(threading.Thread):
     def process_segments(self, segments, buffer_timestamp):
         processed_segments = []
         for segment in segments:
-            if not segment.words:
+            words = segment.words or []
+            if not words and segment.text.strip():
+                # Fallback path for backends that only provide segment-level timestamps.
+                segment_start = float(segment.start or 0.0)
+                segment_end = float(segment.end or segment_start)
+                words = [
+                    TranscribedWord(
+                        word=segment.text.strip(),
+                        start=segment_start,
+                        end=segment_end,
+                        probability=1.0,
+                    )
+                ]
+            if not words:
                 continue
-            
-            current_speaker, _ = self.speaker.current
-            current_group = {
-                "speaker": current_speaker,
-                "words": [],
-                "start": None,
-                "end": None,
-                "text": ""
-            }
-            
-            for word in segment.words:
+
+            current_group = None
+            for word in words:
                 word_start = buffer_timestamp + word.start
                 word_end = buffer_timestamp + word.end
-                
                 cleaned_word = word.word.strip()
-                if cleaned_word:
-                    current_group["words"].append({
-                        "word": cleaned_word,
-                        "start": word_start,
-                        "end": word_end,
-                        "probability": word.probability
-                    })
-                    
-                    if current_group["start"] is None:
-                        current_group["start"] = word_start
-                    current_group["end"] = word_end
-            
-            if current_group["words"]:
+                if not cleaned_word:
+                    continue
+
+                midpoint = (word_start + word_end) / 2.0 if word_end >= word_start else word_start
+                word_speaker = self.speaker.get_speaker_for_timestamp(midpoint)
+
+                if current_group is None or current_group["speaker"] != word_speaker:
+                    if current_group and current_group["words"]:
+                        current_group["text"] = " ".join(
+                            word_info["word"] for word_info in current_group["words"]
+                        ).strip()
+                        processed_segments.append(current_group)
+                    current_group = {
+                        "speaker": word_speaker,
+                        "words": [],
+                        "start": None,
+                        "end": None,
+                        "text": ""
+                    }
+
+                current_group["words"].append({
+                    "word": cleaned_word,
+                    "start": word_start,
+                    "end": word_end,
+                    "probability": word.probability
+                })
+
+                if current_group["start"] is None:
+                    current_group["start"] = word_start
+                current_group["end"] = word_end
+
+            if current_group and current_group["words"]:
                 current_group["text"] = " ".join(
                     word_info["word"] for word_info in current_group["words"]
                 ).strip()
@@ -381,20 +583,42 @@ class TranscriptionWorker(threading.Thread):
         self.stop_event.set()
 
 class Whisperize:
-    def __init__(self, config_path: Optional[str] = None, input_source: str = None):
-        resolved_config_path = config_path or (
-            "config.local.json" if os.path.exists("config.local.json") else "config.json"
-        )
+    def __init__(
+        self,
+        config_path: Optional[str] = None,
+        input_source: str = None,
+        force_hf_refresh: bool = False,
+    ):
+        self.config = DEFAULT_CONFIG.copy()
+        self.force_hf_refresh = force_hf_refresh
 
-        with open(resolved_config_path) as f:
-            self.config = json.load(f)
-            if input_source:
-                self.config["input_source"] = input_source
+        config_candidates = [config_path] if config_path else ["config.local.json", "config.json"]
+        resolved_config_path = next((path for path in config_candidates if path and os.path.exists(path)), None)
+
+        if resolved_config_path:
+            with open(resolved_config_path) as f:
+                loaded_config = json.load(f)
+                if not isinstance(loaded_config, dict):
+                    raise ValueError(f"Invalid config format in {resolved_config_path}. Expected JSON object.")
+                self.config.update(loaded_config)
+            logging.info(f"Loaded configuration from {resolved_config_path}")
+        else:
+            logging.info("No config file found. Using built-in defaults.")
+
+        if input_source:
+            self.config["input_source"] = input_source
         
         # Validate configuration
         self._validate_config()
         
         os.makedirs(self.config["output_folder"], exist_ok=True)
+        self.model_cache_dir = os.path.abspath(self.config.get("model_cache_dir", ".model_cache"))
+        self.hf_cache_dir = os.path.join(self.model_cache_dir, "huggingface")
+        self.pyannote_cache_dir = os.path.join(self.model_cache_dir, "pyannote")
+        os.makedirs(self.hf_cache_dir, exist_ok=True)
+        os.makedirs(self.pyannote_cache_dir, exist_ok=True)
+        os.environ["HF_HOME"] = self.hf_cache_dir
+
         self.timestamp_manager = TimestampManager()
         self.queue_put_lock = threading.Lock()
         self.transcript_lock = threading.Lock()
@@ -433,37 +657,102 @@ class Whisperize:
         # Validate output_folder
         if not self.config.get("output_folder"):
             raise ValueError("output_folder must be specified in config.json")
+
+        model_cache_dir = self.config.get("model_cache_dir")
+        if not isinstance(model_cache_dir, str) or not model_cache_dir.strip():
+            raise ValueError("model_cache_dir must be a non-empty string path")
+
+        for key in ("diarization_min_speakers", "diarization_max_speakers"):
+            value = self.config.get(key)
+            if value is not None and (not isinstance(value, int) or value <= 0):
+                raise ValueError(f"{key} must be a positive integer or null")
+        min_speakers = self.config.get("diarization_min_speakers")
+        max_speakers = self.config.get("diarization_max_speakers")
+        if (
+            min_speakers is not None
+            and max_speakers is not None
+            and min_speakers > max_speakers
+        ):
+            raise ValueError("diarization_min_speakers cannot be greater than diarization_max_speakers")
         
         # Validate output_format
         output_format = self.config.get("output_format", "text")
         if output_format not in ["text", "json"]:
             raise ValueError(f"Invalid output_format: {output_format}. Must be 'text' or 'json'.")
 
-    def _init_models(self):
-        default_device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-        force_cpu = self.config.get("whisper_force_cpu", False)
-        diarizer_device = "cpu" if force_cpu else default_device
-
-        # faster-whisper (CTranslate2) does not support Apple MPS yet.
-        whisper_device = "cpu" if force_cpu else ("cuda" if torch.cuda.is_available() else "cpu")
-        if not force_cpu and default_device == "mps":
-            logging.warning(
-                "MPS detected but faster-whisper does not support it; "
-                "falling back to CPU for transcription."
+        # Validate model alias for MLX backend.
+        model_name = self.config.get("model", "base")
+        if model_name not in ["tiny", "base", "small", "medium", "large", "turbo"]:
+            raise ValueError(
+                f"Invalid model: {model_name}. Must be one of "
+                "'tiny', 'base', 'small', 'medium', 'large', or 'turbo'."
             )
 
-        self.whisper = WhisperModel(
-            self.config.get("model", "base"),
-            device=whisper_device,
-            compute_type="int8" if whisper_device == "cpu" else "float16"
-        )
-        
+    def _init_models(self):
+        default_device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+        diarizer_device = default_device
+        self.transcription_backend = "mlx"
+        use_local_only = not self.force_hf_refresh
+
+        if use_local_only:
+            # Keep this before any huggingface_hub/pyannote import in this run.
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            logging.info("Using strict local-only model mode (no HuggingFace requests).")
+        else:
+            os.environ.pop("HF_HUB_OFFLINE", None)
+            os.environ.pop("TRANSFORMERS_OFFLINE", None)
+            logging.info("Forced HuggingFace cache refresh enabled for this run.")
+
+        model_name = self.config.get("model", "base")
+        try:
+            import mlx_whisper
+        except ImportError as e:
+            raise ImportError(
+                "mlx-whisper is required. Install it with: pip install mlx-whisper"
+            ) from e
+
+        model_alias = {
+            "tiny": "mlx-community/whisper-tiny-mlx",
+            "base": "mlx-community/whisper-base-mlx",
+            "small": "mlx-community/whisper-small-mlx",
+            "medium": "mlx-community/whisper-medium-mlx",
+            "large": "mlx-community/whisper-large-v3-mlx",
+            "turbo": "mlx-community/whisper-large-v3-turbo",
+        }
+        mlx_repo = model_alias.get(model_name)
         token = self.config.get("huggingface_token")
         if not token:
             raise ValueError("HuggingFace token required from environment variables")
-            
+
+        pyannote_pipeline_repo = "pyannote/speaker-diarization-3.1"
+        pyannote_dependencies = [
+            "pyannote/segmentation-3.0",
+            "pyannote/speaker-diarization-community-1",
+            "pyannote/wespeaker-voxceleb-resnet34-LM",
+        ]
+
+        mlx_local_path = self._cache_hf_repo(mlx_repo, token=token)
+        pyannote_pipeline_local_path = self._cache_hf_repo(pyannote_pipeline_repo, token=token)
+        for repo_id in pyannote_dependencies:
+            self._cache_hf_repo(repo_id, token=token)
+
+        logging.info(f"Using mlx-whisper backend with local cache: {mlx_local_path}")
+        self.transcriber = MlxWhisperTranscriber(model_repo=mlx_local_path, module=mlx_whisper)
+        
+        diarizer_token = token if self.force_hf_refresh else None
+        diarization_min_speakers = self.config.get("diarization_min_speakers")
+        diarization_max_speakers = self.config.get("diarization_max_speakers")
         try:
-            self.diarizer = Diarizer(auth_token=token, device=diarizer_device)
+            self.diarizer = Diarizer(
+                auth_token=diarizer_token,
+                device=diarizer_device,
+                cache_dir=self.pyannote_cache_dir,
+                pipeline_source=pyannote_pipeline_local_path,
+                local_files_only=use_local_only,
+                min_speakers=diarization_min_speakers,
+                max_speakers=diarization_max_speakers,
+            )
         except Exception as e:
             error_text = str(e).lower()
             mps_related_error = "mps" in error_text or "unsupported device" in error_text
@@ -472,7 +761,15 @@ class Whisperize:
                     f"Diarization does not support MPS in this setup ({e}); "
                     "falling back to CPU."
                 )
-                self.diarizer = Diarizer(auth_token=token, device="cpu")
+                self.diarizer = Diarizer(
+                    auth_token=diarizer_token,
+                    device="cpu",
+                    cache_dir=self.pyannote_cache_dir,
+                    pipeline_source=pyannote_pipeline_local_path,
+                    local_files_only=use_local_only,
+                    min_speakers=diarization_min_speakers,
+                    max_speakers=diarization_max_speakers,
+                )
             else:
                 raise
         self.diarization_queue = queue.Queue(maxsize=100)
@@ -488,13 +785,42 @@ class Whisperize:
         self.diarization_worker.start()
 
         self.transcription_worker = TranscriptionWorker(
-            whisper=self.whisper,
+            transcriber=self.transcriber,
             transcription_queue=self.transcription_queue,
             speaker=self.speaker,
             config=self.config,
             write_transcript_func=self._write_transcript
         )
         self.transcription_worker.start()
+
+    def _cache_hf_repo(self, repo_id: str, token: str) -> str:
+        """Resolve a model snapshot from local cache, downloading only when needed."""
+        from huggingface_hub import snapshot_download
+
+        if self.force_hf_refresh:
+            logging.info(f"Refreshing HuggingFace cache for {repo_id}")
+            return snapshot_download(
+                repo_id=repo_id,
+                token=token,
+                cache_dir=self.hf_cache_dir,
+                force_download=True,
+                resume_download=True,
+            )
+
+        try:
+            local_path = snapshot_download(
+                repo_id=repo_id,
+                token=token,
+                cache_dir=self.hf_cache_dir,
+                local_files_only=True,
+            )
+            logging.info(f"Loaded {repo_id} from local cache")
+            return local_path
+        except Exception:
+            raise RuntimeError(
+                f"Local cache missing for {repo_id}. "
+                "Run once with --refresh-hf-cache to download required models."
+            )
 
     def _init_audio(self):
         self.audio_buffer = AudioBuffer(
@@ -534,11 +860,16 @@ class Whisperize:
 
         float_buffer = audio_buffer.astype(np.float32) / 32768.0
         filtered_buffer = np.diff(float_buffer, prepend=float_buffer[0])
+        if filtered_buffer.size == 0:
+            return True
         rms = np.sqrt(np.mean(filtered_buffer ** 2))
+        if not np.isfinite(rms):
+            return True
         return rms <= threshold
 
-    def process_audio_chunk(self, audio_chunk: np.ndarray):
-        buffer_timestamp = datetime.now().timestamp()
+    def process_audio_chunk(self, audio_chunk: np.ndarray, buffer_timestamp: Optional[float] = None):
+        if buffer_timestamp is None:
+            buffer_timestamp = datetime.now().timestamp()
         audio_data = AudioChunk(audio_buffer=audio_chunk, timestamp=buffer_timestamp)
         
         # Keep diarization/transcription queues aligned.
@@ -675,11 +1006,14 @@ class Whisperize:
         logging.info(f"Processing {audio_path}...")
         
         try:
+            emitted_samples = 0
             for chunk in self.audio_processor.process_file(audio_path):
                 if not self.is_silent(chunk):
                     if self.audio_buffer.add(chunk):
                         buffer_data = self.audio_buffer.get()
-                        self.process_audio_chunk(buffer_data)
+                        buffer_timestamp = self.timestamp_manager.start_time + (emitted_samples / 16000.0)
+                        self.process_audio_chunk(buffer_data, buffer_timestamp=buffer_timestamp)
+                        emitted_samples += len(buffer_data)
             
             # Add sentinel value to signal end of processing
             self._try_put_sentinel(self.transcription_queue, "transcription")
@@ -785,11 +1119,38 @@ class Whisperize:
                 "relying on stop event to terminate worker"
             )
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Whisperize transcription + diarization")
+    parser.add_argument(
+        "input_source",
+        nargs="?",
+        default="microphone",
+        help="Audio input source: 'microphone' or path to WAV file",
+    )
+    parser.add_argument(
+        "--config",
+        dest="config_path",
+        default=None,
+        help="Path to config JSON file (optional)",
+    )
+    parser.add_argument(
+        "--refresh-hf-cache",
+        action="store_true",
+        help="Force refresh models from HuggingFace for this run",
+    )
+    return parser.parse_args()
+
+
 def main():
-    input_source = sys.argv[1] if len(sys.argv) > 1 else "microphone"
+    args = parse_args()
+    input_source = args.input_source
     
     try:
-        app = Whisperize(input_source=input_source)
+        app = Whisperize(
+            config_path=args.config_path,
+            input_source=input_source,
+            force_hf_refresh=args.refresh_hf_cache,
+        )
         if input_source == "microphone":
             app.process_microphone()
         else:

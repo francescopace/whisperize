@@ -2,9 +2,10 @@
     "output_folder": "transcripts/",
     "output_format": "text",
     "model": "turbo",
-    "whisper_force_cpu": false,
-    "language": "it",
+    "language": "en",
     "buffer_duration": 4,
-    "beam_size": 5,
-    "temperature": [0.0, 0.2, 0.4]
+    "temperature": [0.0, 0.2, 0.4],
+    "model_cache_dir": ".model_cache",
+    "diarization_min_speakers": null,
+    "diarization_max_speakers": null
 }

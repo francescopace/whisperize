@@ -1,150 +1,108 @@
 # Whisperize
 
-A Python application for real-time audio transcription and speaker diarization using Faster-Whisper and PyAnnote.
+Real-time audio transcription with speaker diarization, optimized for Apple Silicon.
+Uses [MLX Whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) for transcription and [PyAnnote](https://github.com/pyannote/pyannote-audio) for speaker identification.
 
 ## Features
-- Real-time audio transcription
-- Advanced speaker diarization using PyAnnote
-- Support for microphone and audio file input
-- Multiple Whisper model sizes and quantization options
-- Configurable via JSON with text or JSON output formats
-- Thread-safe parallel processing of transcription and diarization
+
+- Live microphone and WAV file transcription
+- Speaker diarization (who said what)
+- Multiple Whisper model sizes with MLX acceleration
+- Text and JSON output formats
+- Offline-first: runs from local model cache after initial download
 
 ## Requirements
 
+- macOS (Apple Silicon)
 - Python 3.12
-- System dependencies:
-  - **macOS (Homebrew)**:
-    ```bash
-    brew install ffmpeg portaudio
-    ```
-  - **Ubuntu/Debian**:
-    ```bash
-    sudo apt-get install ffmpeg portaudio19-dev
-    ```
-  - **Windows (Chocolatey)**:
-    ```bash
-    choco install ffmpeg
-    ```
-    For microphone input, install PortAudio binaries/development headers and ensure they are available in your build environment.
-
-### Runtime note (macOS)
-
-If you still see duplicate FFmpeg Objective-C warnings at startup, it usually means
-different FFmpeg builds are loaded at the same time (e.g. Homebrew + wheel-bundled FFmpeg).
+- [FFmpeg](https://ffmpeg.org/) and [PortAudio](http://www.portaudio.com/) via Homebrew:
 
 ```bash
-brew install pkg-config ffmpeg
-pip uninstall -y av
-PKG_CONFIG_PATH="$(brew --prefix ffmpeg)/lib/pkgconfig" pip install --no-binary av av
+brew install ffmpeg portaudio
 ```
-
-This rebuilds `av` against your system FFmpeg and is the most reliable way to reduce those warnings.
 
 ## Installation
 
-### 1. Clone the Repository
 ```bash
 git clone https://github.com/francescopace/whisperize.git
 cd whisperize
-```
-
-### 2. Create and Activate Virtual Environment
-```bash
 python -m venv .venv
-source .venv/bin/activate  # On Unix/macOS
-# or
-.venv\Scripts\activate  # On Windows
-```
-
-### 3. Install Dependencies
-```bash
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4. Configure the Application
-1. Create a HuggingFace account at [https://huggingface.co/](https://huggingface.co/)
-2. Generate an access token at [https://huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
-3. Export the token in your shell (recommended to avoid committing secrets):
+### HuggingFace token
+
+A HuggingFace token is required to download the PyAnnote diarization model.
+
+1. Create an account at [huggingface.co](https://huggingface.co/)
+2. Generate a token at [Settings > Tokens](https://huggingface.co/settings/tokens)
+3. Export it in your shell:
 
 ```bash
 export HUGGINGFACE_TOKEN="your_token_here"
 ```
 
-4. Create a local config file and update with your settings:
+## Usage
+
+```bash
+# Microphone (default)
+python whisperize.py
+
+# WAV file
+python whisperize.py path/to/audio.wav
+
+# Force model cache refresh from HuggingFace
+python whisperize.py --refresh-hf-cache
+```
+
+> WAV files must be 16-bit, 16 kHz, mono or stereo.
+
+By default Whisperize runs in **local-only mode** — it loads models from the local cache without contacting HuggingFace. If a model is missing, run once with `--refresh-hf-cache` to download it.
+
+## Configuration
+
+Copy the example config to get started:
 
 ```bash
 cp config.example.json config.local.json
 ```
 
-`config.local.json` is ignored by git and automatically preferred over `config.json` if present.
+`config.local.json` is git-ignored and takes precedence over `config.json`. If no config file is found, built-in defaults are used.
 
-```json
-{
-    "output_folder": "transcripts/",
-    "output_format": "text",
-    "model": "turbo",
-    "whisper_force_cpu": false,
-    "language": "it",
-    "buffer_duration": 4,
-    "beam_size": 5,
-    "temperature": [0.0, 0.2, 0.4]
-}
-```
+| Parameter | Default | Description |
+|---|---|---|
+| `output_folder` | `"transcripts/"` | Directory for saved transcripts |
+| `output_format` | `"text"` | `"text"` or `"json"` |
+| `model` | `"turbo"` | Whisper model size (see table below) |
+| `language` | auto-detect | Language code (`"en"`, `"it"`, `"es"`, …) |
+| `buffer_duration` | `4.0` | Audio buffer length in seconds |
+| `temperature` | `[0.0, 0.2, 0.4]` | Whisper decoding temperature schedule |
+| `model_cache_dir` | `".model_cache"` | Local directory for model snapshots |
+| `diarization_min_speakers` | `null` | Optional lower bound for diarization speaker count |
+| `diarization_max_speakers` | `null` | Optional upper bound for diarization speaker count |
 
-#### Configuration Parameters
+For fixed-speaker test clips (like your generated 3-speaker sample), set both values to `3` to stabilize clustering.
 
-- **HUGGINGFACE_TOKEN / HF_TOKEN** (required env var): HuggingFace API token used to access PyAnnote models
-- **output_folder** (required): Directory where transcripts will be saved
-- **output_format** (optional): Output format - `"text"` or `"json"` (default: `"text"`)
-  - `text`: Creates a human-readable transcript with timestamps
-  - `json`: Creates both a text file and a structured JSON file with metadata and word-level timestamps
-- **model** (optional): Whisper model size - `"tiny"`, `"base"`, `"small"`, `"medium"`, `"large"`, `"turbo"` (default: `"base"`)
-- **whisper_force_cpu** (optional): Force CPU usage even if GPU/MPS is available (default: `false`)
-- **language** (optional): Language code (e.g., `"it"`, `"en"`, `"es"`). If not specified, language is auto-detected
-- **buffer_duration** (optional): Audio buffer duration in seconds (default: `5.0`)
-- **beam_size** (optional): Beam size for Whisper decoding (default: `5`)
-- **temperature** (optional): Temperature schedule used by Whisper (default: `[0.0, 0.2, 0.4]`)
+## Models
 
-### Supported Models
+| Alias | MLX Model | Notes |
+|---|---|---|
+| `tiny` | `mlx-community/whisper-tiny-mlx` | Fastest, lowest accuracy |
+| `base` | `mlx-community/whisper-base-mlx` | Good speed/accuracy balance |
+| `small` | `mlx-community/whisper-small-mlx` | Better accuracy |
+| `medium` | `mlx-community/whisper-medium-mlx` | High accuracy |
+| `large` | `mlx-community/whisper-large-v3-mlx` | Highest accuracy |
+| `turbo` | `mlx-community/whisper-large-v3-turbo` | Optimized large model |
 
-#### Whisper Models
-The application uses Faster-Whisper for transcription. Available models:
-- `tiny` - Fastest, lowest accuracy
-- `base` - Good balance of speed and accuracy
-- `small` - Better accuracy, slower
-- `medium` - High accuracy
-- `large` - Highest accuracy, slowest
-- `turbo` - Optimized large model
+Speaker diarization uses **PyAnnote speaker-diarization-3.1**, loaded automatically via the HuggingFace token.
 
-See [Whisper documentation](https://github.com/openai/whisper?tab=readme-ov-file#available-models-and-languages) for language support and model details.
+See the [Whisper docs](https://github.com/openai/whisper#available-models-and-languages) for language support details.
 
-#### Diarization Model
-The application uses **PyAnnote speaker-diarization-3.1** for speaker identification. This model is automatically loaded and requires a HuggingFace token for access.
+## Output
 
-## Usage
+### Text format
 
-### Basic Usage
-
-**Microphone Input (default):**
-```bash
-python whisperize.py
-# or explicitly
-python whisperize.py microphone
-```
-
-**Audio File Input:**
-```bash
-python whisperize.py path/to/audio.wav
-```
-
-**Note:** Only WAV files (16-bit, **16kHz**, mono or stereo) are currently supported.
-
-### Output
-
-Transcripts are saved in the `output_folder` specified in `config.json`:
-
-**Text Format** (`output_format: "text"`):
 ```
 # Transcript started at 2025-02-11 18:30:00
 
@@ -152,11 +110,10 @@ Transcripts are saved in the `output_folder` specified in `config.json`:
 [00:00:06.100-00:00:09.800] [SPEAKER_01]: Yes, I can hear you clearly.
 ```
 
-**JSON Format** (`output_format: "json"`):
-- Creates both a `.txt` file (for real-time monitoring) and a `.json` file
-- JSON includes metadata, speaker labels, timestamps, and word-level details with confidence scores
+### JSON format
 
-Example JSON structure:
+Produces both a `.txt` file (for live monitoring) and a `.json` file with full metadata:
+
 ```json
 {
   "metadata": {
@@ -169,18 +126,22 @@ Example JSON structure:
   "segments": [
     {
       "speaker": "SPEAKER_00",
-      "start": 2.500,
-      "end": 5.300,
+      "start": 2.5,
+      "end": 5.3,
       "text": "Hello, this is a test transcription.",
       "words": [
-        {
-          "word": "Hello",
-          "start": 2.500,
-          "end": 2.800,
-          "probability": 0.95
-        }
+        { "word": "Hello", "start": 2.5, "end": 2.8, "probability": 0.95 }
       ]
     }
   ]
 }
+```
+
+## Troubleshooting
+
+**Duplicate FFmpeg Objective-C warnings at startup** — usually caused by multiple FFmpeg builds loaded simultaneously (Homebrew + wheel-bundled). Fix by rebuilding `av` against the system FFmpeg:
+
+```bash
+pip uninstall -y av
+PKG_CONFIG_PATH="$(brew --prefix ffmpeg)/lib/pkgconfig" pip install --no-binary av av
 ```

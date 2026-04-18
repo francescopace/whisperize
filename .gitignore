@@ -5,6 +5,7 @@ transcripts
 tmp
 inputs
 mlx_models
+.model_cache
 config.local.json
 *.segments.jsonl
 __pycache__
