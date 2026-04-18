@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import subprocess
 import sys
 import types
@@ -118,6 +119,49 @@ class _FakeTranscriber:
         return [whisperize.TranscribedSegment(text=text, words=words, start=0.0, end=cursor)]
 
 
+class _SegmentGuidedTranscriber:
+    def __init__(self) -> None:
+        self._idx = 0
+        self._texts = [
+            "alpha one",
+            "beta two",
+            "gamma three",
+        ]
+
+    def transcribe(self, audio_buffer, initial_prompt, options):
+        text = self._texts[min(self._idx, len(self._texts) - 1)]
+        self._idx += 1
+
+        words = []
+        cursor = 0.25
+        for token in text.split():
+            start = cursor
+            end = start + 0.12
+            cursor = end + 0.13
+            words.append(
+                whisperize.TranscribedWord(
+                    word=token,
+                    start=start,
+                    end=end,
+                    probability=0.99,
+                )
+            )
+
+        return [whisperize.TranscribedSegment(text=text, words=words, start=words[0].start, end=words[-1].end)]
+
+
+class _SegmentGuidedWorker(_DummyWorker):
+    def __init__(self) -> None:
+        self.transcribe_options = {
+            "temperature": (0.0, 0.2, 0.4),
+            "compression_ratio_threshold": 2.4,
+            "no_speech_threshold": 0.6,
+            "condition_on_previous_text": True,
+            "word_timestamps": True,
+            "language": "en",
+        }
+
+
 def _repo_root() -> Path:
     return REPO_ROOT
 
@@ -161,6 +205,11 @@ def _fake_process_audio_chunk(self, audio_chunk) -> None:
     self.transcription_worker._process_chunk(chunk, retries=1)
 
 
+def _timestamp_to_seconds(timestamp: str) -> float:
+    hours, minutes, seconds = timestamp.split(":")
+    return (int(hours) * 3600) + (int(minutes) * 60) + float(seconds)
+
+
 def test_whisperize_generates_expected_transcript_for_english_fixture_audio(tmp_path, monkeypatch):
     audio_path = _ensure_english_audio_fixture()
 
@@ -197,3 +246,71 @@ def test_whisperize_generates_expected_transcript_for_english_fixture_audio(tmp_
     assert "[SPEAKER_00]" in transcript
     assert "[SPEAKER_01]" in transcript
     assert "[SPEAKER_02]" in transcript
+
+
+def test_segment_guided_file_mode_preserves_speaker_labels_and_relative_timestamps(tmp_path, monkeypatch):
+    audio_path = _ensure_english_audio_fixture()
+
+    output_dir = tmp_path / "transcripts"
+    config_path = tmp_path / "config.segment_guided.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "output_folder": str(output_dir),
+                "output_format": "text",
+                "model": "base",
+                "language": "en",
+                "buffer_duration": 1.0,
+                "temperature": [0.0, 0.2, 0.4],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _init_models_segment_guided(self) -> None:
+        self.transcriber = _SegmentGuidedTranscriber()
+        self.speaker = whisperize.Speaker()
+        self.diarization_queue = queue.Queue(maxsize=100)
+        self.transcription_queue = queue.Queue(maxsize=100)
+        self.diarization_worker = _DummyWorker()
+        self.transcription_worker = _SegmentGuidedWorker()
+
+    def _prime_segments(_self, _audio_path):
+        return [
+            {"speaker": "SPEAKER_00", "start": 0.0, "end": 2.0},
+            {"speaker": "SPEAKER_01", "start": 4.0, "end": 6.0},
+            {"speaker": "SPEAKER_02", "start": 8.0, "end": 10.0},
+        ]
+
+    monkeypatch.setenv("HUGGINGFACE_TOKEN", "test-token")
+    monkeypatch.setattr(whisperize.Whisperize, "_init_models", _init_models_segment_guided)
+    monkeypatch.setattr(whisperize.Whisperize, "_prime_speaker_timeline_for_file", _prime_segments)
+
+    app = whisperize.Whisperize(config_path=str(config_path), input_source=str(audio_path))
+    app.process_file(str(audio_path))
+
+    transcript_path = Path(app.transcript_path)
+    assert transcript_path.exists(), "Transcript file was not generated"
+
+    transcript_lines = transcript_path.read_text(encoding="utf-8").splitlines()
+    content_lines = [line for line in transcript_lines if line.startswith("[")]
+    assert len(content_lines) == 3
+
+    assert "[SPEAKER_00]: alpha one" in content_lines[0]
+    assert "[SPEAKER_01]: beta two" in content_lines[1]
+    assert "[SPEAKER_02]: gamma three" in content_lines[2]
+
+    matched_timestamps = []
+    for line in content_lines:
+        match = re.match(
+            r"^\[(\d{2}:\d{2}:\d{2}\.\d{3})-(\d{2}:\d{2}:\d{2}\.\d{3})\] \[SPEAKER_\d{2}\]: .+$",
+            line,
+        )
+        assert match, f"Unexpected transcript line format: {line}"
+        matched_timestamps.append((_timestamp_to_seconds(match.group(1)), _timestamp_to_seconds(match.group(2))))
+
+    expected_starts = [0.25, 4.05, 8.05]
+    for idx, expected_start in enumerate(expected_starts):
+        actual_start, actual_end = matched_timestamps[idx]
+        assert actual_start == pytest.approx(expected_start, abs=0.02)
+        assert actual_end > actual_start

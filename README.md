@@ -10,6 +10,7 @@ Optimized for **macOS on Apple Silicon** — all models run locally with MLX acc
 
 - Live transcription from microphone and WAV files
 - Automatic speaker recognition (speaker diarization)
+- Segment-guided WAV processing for more stable speaker labels and timestamps
 - Multiple Whisper model sizes with MLX acceleration
 - Text and JSON output with timestamps and confidence scores
 - Offline-first: after the initial download, everything runs locally
@@ -86,6 +87,7 @@ cp config.example.json config.local.json
 | `diarization_max_speakers` | `null` | Optional upper bound for diarization speaker count |
 
 With both values set to `null`, speaker count is estimated automatically.
+`buffer_duration` affects microphone streaming (and file-mode fallback chunking). The primary WAV path uses segment-guided processing from full-file diarization.
 
 ## Models
 
@@ -113,6 +115,8 @@ See the [Whisper docs](https://github.com/openai/whisper#available-models-and-la
 [00:00:06.100-00:00:09.800] [SPEAKER_01]: Yes, I can hear you clearly.
 ```
 
+For WAV inputs, timestamps are relative to the start of the file (`00:00:00.xxx`).
+
 ### JSON format
 
 Produces both a `.txt` file (for live monitoring) and a `.json` file with full metadata:
@@ -139,6 +143,16 @@ Produces both a `.txt` file (for live monitoring) and a `.json` file with full m
   ]
 }
 ```
+
+## Testing
+
+Run the test suite with:
+
+```bash
+pytest -q
+```
+
+The suite includes a dedicated regression test for the segment-guided WAV path in `tests/test_whisperize_output.py` to guard speaker assignment and timestamp alignment.
 
 ## Troubleshooting
 
